@@ -62,3 +62,10 @@ verdict() {
   printf("%s: %u wrong results\n", trace::wrong ? "failed" : "passed", trace::wrong);
   return trace::wrong != 0;
 }
+
+// the last word of a test whose work the run cannot do here: what it waits on, as the run names a skip
+inline int
+verdict_skipped(const char *what) {
+  printf("skipped: %s\n", what);
+  return 77;
+}

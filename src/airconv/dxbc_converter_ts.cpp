@@ -79,7 +79,7 @@ tessellation_groups() {
 }
 
 size_t
-estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group, bool groups) {
+estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group, bool groups, bool stream_output) {
   auto max_hs_output_register = pHullStage->max_output_register;
   auto cp_size_per_point = sizeof(uint32_t) * 4 * max_hs_output_register;
   auto cp_size_per_patch = cp_size_per_point * pHullStage->output_control_point_count;
@@ -92,10 +92,12 @@ estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t pat
   constexpr uint32_t size_workload_info = sizeof(TessMeshWorkload);
 
   // the patches' control points and constants, the first patch's number, the workloads, the grid's first
-  // workload and instance, and the groups of workloads (tessellation_payload_type)
+  // workload and instance, and the groups of workloads, or stream output's place (tessellation_payload_type)
   return cp_size_per_group + pc_size_per_group + sizeof(uint32_t) +
          max_workload_count * patch_per_group * size_workload_info + 2 * sizeof(uint32_t) +
-         (groups ? (max_workload_count + 1) * patch_per_group * sizeof(uint32_t) : 0);
+         (groups ? (max_workload_count + 1) * patch_per_group * sizeof(uint32_t)
+                 : stream_output ? kTessellationStreamOutputPlace
+                                 : 0);
 };
 
 std::pair<uint32_t, uint32_t>
@@ -103,9 +105,11 @@ mesh_threadgroups_per_workload(
     SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, uint32_t factor_int
 ) {
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
-  // without a geometry shader, as many as share the workload's primitives
-  if (!args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess) ||
-      !pso_tess->geometry)
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
+  bool geometry = args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess) &&
+                  pso_tess->geometry;
+  // without a geometry shader, as many as share the workload's primitives, or with stream output one for each
+  if (!geometry && !args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pArgs, &so))
     return {tessellation_pieces(
                 factor_int, pHullStage->tessellation_domain, pHullStage->tessellator_output_primitive,
                 pso_tess ? pso_tess->mesh_vertex_size : 0, pso_tess && pso_tess->conservative
@@ -114,7 +118,7 @@ mesh_threadgroups_per_workload(
             1};
   // a workload's primitives do not outnumber its vertices
   return {get_max_workload_vertices(factor_int, pHullStage->tessellation_domain),
-          ((SM50ShaderInternal *)pso_tess->geometry)->gs_instance_count};
+          geometry ? ((SM50ShaderInternal *)pso_tess->geometry)->gs_instance_count : 1};
 }
 
 std::pair<float, uint32_t>
@@ -129,14 +133,16 @@ get_final_maxtessfactor(SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_
 
 // a mesh threadgroup takes as many of a patch's workloads as fit its mesh (tessellation_group_size), and all its
 // threads make their primitives together, one SIMD group of 32 as on every GPU with mesh shaders. not with a geometry
-// shader, which takes a workload's primitives one a threadgroup, nor where threadgroups share a workload's primitives
+// shader or stream output, which take a workload's primitives one a threadgroup, nor where threadgroups share a
+// workload's primitives
 uint32_t
 tessellation_group_limit(SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs, uint32_t factor_int) {
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
   if (!tessellation_groups() ||
       !args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess) ||
-      pso_tess->geometry)
+      pso_tess->geometry || args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pArgs, &so))
     return 0;
   if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common) && sm50_common->simd_width &&
       sm50_common->simd_width != 32)
@@ -162,7 +168,7 @@ tessellation_group_limit(SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION
 llvm::StructType *
 tessellation_payload_type(
     SM50ShaderInternal *pHullStage, uint32_t factor_int, air::AirType &types, llvm::LLVMContext &context,
-    uint32_t group_limit
+    uint32_t group_limit, bool stream_output
 ) {
   uint32_t patch_per_group = next_pow2(32 / next_pow2(pHullStage->hull_maximum_threads_per_patch));
   auto per_patch = llvm::ArrayType::get(
@@ -183,6 +189,12 @@ tessellation_payload_type(
   if (group_limit) {
     fields.push_back(llvm::ArrayType::get(types._int, workloads));
     fields.push_back(llvm::ArrayType::get(types._int, patch_per_group));
+  }
+  // with stream output, which has no groups, the object threadgroup's place in the draw and the primitives each
+  // stream had before it (kTessellationStreamOutputGroup)
+  if (stream_output) {
+    fields.push_back(types._int);
+    fields.push_back(llvm::ArrayType::get(types._long, 4));
   }
   return llvm::StructType::create(context, fields, "payload");
 }
@@ -385,6 +397,8 @@ convert_dxbc_vertex_hull_shader(
   auto [workload_primitives, geometry_instances] = mesh_threadgroups_per_workload(pHullStage, pArgs, factor_int);
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
   args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pArgs, &pso_tess);
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
+  args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pArgs, &so);
   // the most a grid has (tessellation_grids). left out while the pipeline is to tell what the device lets one have
   uint32_t grid_limit = pso_tess ? pso_tess->max_mesh_threadgroups : 0;
   if (!pso_tess || grid_limit) {
@@ -393,8 +407,10 @@ convert_dxbc_vertex_hull_shader(
   }
 
   uint32_t group_limit = tessellation_group_limit(pHullStage, pArgs, factor_int);
-  auto payload_struct_type = tessellation_payload_type(pHullStage, factor_int, types, context, group_limit);
+  auto payload_struct_type = tessellation_payload_type(pHullStage, factor_int, types, context, group_limit, so != nullptr);
   uint32_t payload_struct_size = module.getDataLayout().getTypeAllocSize(payload_struct_type);
+  if (so && payload_struct_size > 16384)
+    return llvm::make_error<UnsupportedFeature>("payload of a tessellated draw with stream output is too large");
 
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{.size = payload_struct_size});
   uint32_t thread_id_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
@@ -443,6 +459,7 @@ convert_dxbc_vertex_hull_shader(
         .arg_name = "patch_size",
         .raster_order_group = {}
     });
+  uint32_t so_idx = so ? stream_output_input(func_signature, context, types) : ~0u;
 
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, true);
 
@@ -526,6 +543,27 @@ convert_dxbc_vertex_hull_shader(
   auto next_workload = next_at(0);
   auto factors_type = llvm::ArrayType::get(types._float, 6);
   auto kept_factors = builder.CreateAlloca(factors_type);
+
+  // stream output's place of the threadgroup in the draw, and the primitives each stream had before it, which the
+  // threadgroup's threads find together; a primitive streamed out is the geometry shader's, or the tessellator's
+  pvalue so_group = nullptr;
+  std::array<pvalue, 4> so_before = {};
+  if (so) {
+    auto tg = function->getArg(tg_id_idx);
+    auto geometry = pso_tess ? (SM50ShaderInternal *)pso_tess->geometry : nullptr;
+    uint32_t vertices = !geometry ? get_primitive_vertices(pHullStage->tessellator_output_primitive)
+                        : geometry->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ? 3
+                        : geometry->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_LINESTRIP     ? 2
+                                                                                                    : 1;
+    std::tie(so_group, so_before) = tessellation_stream_output_object(
+        builder, types, module, so, function->getArg(so_idx), builder.CreateExtractElement(tg, 0ull),
+        builder.CreateExtractElement(tg, 1ull),
+        builder.CreateAdd(control_point_id_in_patch, builder.CreateMul(patch_offset_in_group, builder.getInt32(threads_per_patch))),
+        builder.CreateICmpEQ(builder.CreateExtractElement(tg, 2ull), builder.getInt32(0)), vertices
+    );
+  }
+  // the counting pass of a stream output draw runs the shaders again: only the writing pass leaves their writes
+  bool discard_writes = so && so->counting;
 
   {
     /* Vertex Shader Zone */
@@ -647,7 +685,9 @@ convert_dxbc_vertex_hull_shader(
     if (auto err = prologue.build(ctx).takeError()) {
       return err;
     }
+    air.DiscardWrites = discard_writes;
     auto real_entry = convert_basicblocks(pVertexStage->entry(), ctx, epilogue_bb);
+    air.DiscardWrites = false;
     if (auto err = real_entry.takeError()) {
       return err;
     }
@@ -791,7 +831,9 @@ convert_dxbc_vertex_hull_shader(
     if (auto err = prologue.build(ctx).takeError()) {
       return err;
     }
+    air.DiscardWrites = discard_writes;
     auto real_entry = convert_basicblocks(pHullStage->entry(), ctx, epilogue_bb);
+    air.DiscardWrites = false;
     if (auto err = real_entry.takeError()) {
       return err;
     }
@@ -995,6 +1037,19 @@ convert_dxbc_vertex_hull_shader(
     );
     builder.CreateStore(first_workload, builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(4)}));
     builder.CreateStore(first_instance, builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(5)}));
+    if (so) {
+      builder.CreateStore(
+          so_group,
+          builder.CreateGEP(payload_struct_type, payload, {builder.getInt32(0), builder.getInt32(kTessellationStreamOutputGroup)})
+      );
+      for (uint32_t s = 0; s < 4; s++)
+        builder.CreateStore(
+            so_before[s], builder.CreateGEP(
+                              payload_struct_type, payload,
+                              {builder.getInt32(0), builder.getInt32(kTessellationStreamOutputBefore), builder.getInt32(s)}
+                          )
+        );
+    }
 
     builder.CreateBr(real_return);
     builder.SetInsertPoint(real_return);

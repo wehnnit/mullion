@@ -5,3 +5,7 @@ EXPORTS
     CreateDXGIFactory2 @11
     DXGIDeclareAdapterRemovalSupport @16
     DXGIGetDebugInterface1 @17
+    DXGID3D10CreateDevice
+    DXGID3D10CreateLayeredDevice
+    DXGID3D10GetLayeredDeviceSize
+    DXGID3D10RegisterLayers

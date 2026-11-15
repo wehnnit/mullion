@@ -1,6 +1,53 @@
 LIBRARY D3D11.DLL
 EXPORTS  
+    D3DKMTCloseAdapter = gdi32.D3DKMTCloseAdapter @2
+    D3DKMTDestroyAllocation = mullion_D3DKMTDestroyAllocation @3
+    D3DKMTDestroyContext = mullion_D3DKMTDestroyContext @4
+    D3DKMTDestroyDevice = gdi32.D3DKMTDestroyDevice @5
+    D3DKMTDestroySynchronizationObject = mullion_D3DKMTDestroySynchronizationObject @6
+    D3DKMTPresent = mullion_D3DKMTPresent @7
+    D3DKMTQueryAdapterInfo = gdi32.D3DKMTQueryAdapterInfo @8
+    D3DKMTSetDisplayPrivateDriverFormat = mullion_D3DKMTSetDisplayPrivateDriverFormat @9
+    D3DKMTSignalSynchronizationObject = mullion_D3DKMTSignalSynchronizationObject @10
+    D3DKMTUnlock = mullion_D3DKMTUnlock @11
+    D3DKMTWaitForSynchronizationObject = mullion_D3DKMTWaitForSynchronizationObject @12
+    OpenAdapter10 @14
+    OpenAdapter10_2 @15
+    CreateDirect3D11DeviceFromDXGIDevice @16
+    CreateDirect3D11SurfaceFromDXGISurface @17
     D3D11CoreCreateDevice @18
+    D3D11CoreCreateLayeredDevice @19
+    D3D11CoreGetLayeredDeviceSize @20
+    D3D11CoreRegisterLayers @21
     D3D11CreateDevice @22
     D3D11CreateDeviceAndSwapChain @23
     D3D11On12CreateDevice @24
+    D3DKMTCreateAllocation = mullion_D3DKMTCreateAllocation @25
+    D3DKMTCreateContext = mullion_D3DKMTCreateContext @26
+    D3DKMTCreateDevice = gdi32.D3DKMTCreateDevice @27
+    D3DKMTCreateSynchronizationObject = mullion_D3DKMTCreateSynchronizationObject @28
+    D3DKMTEscape = gdi32.D3DKMTEscape @29
+    D3DKMTGetContextSchedulingPriority = mullion_D3DKMTGetContextSchedulingPriority @30
+    D3DKMTGetDeviceState = mullion_D3DKMTGetDeviceState @31
+    D3DKMTGetDisplayModeList = mullion_D3DKMTGetDisplayModeList @32
+    D3DKMTGetMultisampleMethodList = mullion_D3DKMTGetMultisampleMethodList @33
+    D3DKMTGetRuntimeData = mullion_D3DKMTGetRuntimeData @34
+    D3DKMTGetSharedPrimaryHandle = mullion_D3DKMTGetSharedPrimaryHandle @35
+    D3DKMTLock = mullion_D3DKMTLock @36
+    D3DKMTOpenAdapterFromHdc = gdi32.D3DKMTOpenAdapterFromHdc @37
+    D3DKMTOpenResource = mullion_D3DKMTOpenResource @38
+    D3DKMTQueryAllocationResidency = mullion_D3DKMTQueryAllocationResidency @39
+    D3DKMTQueryResourceInfo = mullion_D3DKMTQueryResourceInfo @40
+    D3DKMTRender = mullion_D3DKMTRender @41
+    D3DKMTSetAllocationPriority = mullion_D3DKMTSetAllocationPriority @42
+    D3DKMTSetContextSchedulingPriority = mullion_D3DKMTSetContextSchedulingPriority @43
+    D3DKMTSetDisplayMode = mullion_D3DKMTSetDisplayMode @44
+    D3DKMTSetGammaRamp = mullion_D3DKMTSetGammaRamp @45
+    D3DKMTSetVidPnSourceOwner = gdi32.D3DKMTSetVidPnSourceOwner @46
+    D3DKMTWaitForVerticalBlankEvent = mullion_D3DKMTWaitForVerticalBlankEvent @47
+    D3DPerformance_BeginEvent @48
+    D3DPerformance_EndEvent @49
+    D3DPerformance_GetStatus @50
+    D3DPerformance_SetMarker @51
+    D3DKMTCheckVidPnExclusiveOwnership = gdi32.D3DKMTCheckVidPnExclusiveOwnership
+    D3DKMTOpenAdapterFromGdiDisplayName = gdi32.D3DKMTOpenAdapterFromGdiDisplayName

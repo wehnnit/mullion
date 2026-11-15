@@ -780,6 +780,24 @@ struct linear_texture_desc {
   }
 }
 
+// the same integer rounding as a shader's D24 store. float round(depth * (2^24-1)) is one code high
+// for values whose quotient sits just below a tie
+static uint pack_d24(float depth) {
+  float z = clamp(depth, 0.0f, 1.0f);
+  if (!(z > 0.0f))
+    return 0u;
+  if (z >= 1.0f)
+    return kD24UnormMax;
+  uint bits = as_type<uint>(z);
+  int exp = int((bits >> 23) & 255u) - 127;
+  int shift = 23 - exp;
+  if ((bits >> 23) == 0u || shift < 1 || shift > 62)
+    return 0u;
+  ulong mant = ulong(bits & 0x7fffffu) | 0x800000ul;
+  ulong rounded = (mant * ulong(kD24UnormMax) + (1ul << uint(shift - 1))) >> uint(shift);
+  return uint(min(rounded, ulong(kD24UnormMax)));
+}
+
 [[kernel]] void cs_copy_to_buffer_d24s8(
   texture2d<float, access::read> tex_depth [[texture(0)]],
   texture2d<uint, access::read> tex_stencil [[texture(1)]],
@@ -795,7 +813,7 @@ struct linear_texture_desc {
     auto dst = reinterpret_cast<device uint *>(buffer + buffer_offset);
     float depth = tex_depth.read(pos).x;
     uint stencil = tex_stencil.read(pos).x;
-    *dst = (uint(round(kD24UnormMax * clamp(depth, 0.0, 1.0))) & kD24UnormMax) | (stencil << 24);
+    *dst = (pack_d24(depth) & kD24UnormMax) | (stencil << 24);
   }
 }
 
@@ -1602,6 +1620,118 @@ static void ray_trace(thread MullionRayContext &parent, thread SM50_RAY_TRACE &t
                           pos.x * sizeof(packed_uint3)) = packed_uint3(rgba.xyz);
 }
 
+// one texel of a BC4 block, decoded as the reference does (D3D11.3 19.5.2): the signed endpoints come
+// back as the exact floats the spec decodes, which Metal's own BC4_RSnorm sampling does not keep
+static inline float bc4_snorm_texel(device const uchar *block, uint texel) {
+  int e0 = block[0], e1 = block[1];
+  if (e0 > 127)
+    e0 -= 256;
+  if (e1 > 127)
+    e1 -= 256;
+  uint64_t bits = 0;
+  for (uint i = 0; i < 6; i++)
+    bits |= uint64_t(block[2 + i]) << (8 * i);
+  uint index = uint((bits >> (texel * 3)) & 7u);
+  // the spec's decode is integer arithmetic on the endpoint bytes: the endpoints clamp to [-127, 127]
+  // in 1/127 units, the interpolations weight those integers, and one division rounds once
+  int a = max(-127, e0), b = max(-127, e1);
+  if (index == 0)
+    return precise::divide(float(a), 127.0f);
+  if (index == 1)
+    return precise::divide(float(b), 127.0f);
+  if (e0 > e1)
+    return precise::divide(float((8 - int(index)) * a + (int(index) - 1) * b), 7.0f * 127.0f);
+  if (index < 6)
+    return precise::divide(float((6 - int(index)) * a + (int(index) - 1) * b), 5.0f * 127.0f);
+  return index == 6 ? -1.0f : 1.0f;
+}
+
+// a BC4_SNORM footprint's blocks decode into one float per texel (one per channel pair for BC5_SNORM,
+// two floats per texel); `pos` counts texels of the copy's extent
+// a BC4/BC5 SNORM footprint's raw blocks decode into one float per texel channel (two for BC5), by the
+// formula the spec's endpoints give (D3D11.3 19.5.2); `pos` counts texels of the copy's extent
+[[kernel]] void cs_decode_bc_snorm(
+    device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+    constant BCSnormDecodeLayout &layout [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
+  uint2 block = pos / 4;
+  uint texel = (pos.y % 4) * 4 + (pos.x % 4);
+  uint block_bytes = layout.rg ? 16u : 8u;
+  device const uchar *b = src + uint64_t(block.y) * layout.src_row + block.x * block_bytes;
+  float value = bc4_snorm_texel(b, texel);
+#ifdef MULLION_BC_DEBUG
+  // temporary diagnostics: the companion carries the block's first two bytes, so a mismatch report
+  // shows what the kernel read. define MULLION_BC_DEBUG for the metal compile to turn it on
+  if (layout.rg)
+    *(device float2 *)(dst + uint64_t(pos.y) * layout.dst_row + pos.x * sizeof(float2)) =
+        float2(float(b[0]), float(b[1]));
+  else
+    *(device float *)(dst + uint64_t(pos.y) * layout.dst_row + pos.x * sizeof(float)) = float(b[0]);
+  return;
+#endif
+  if (layout.rg) {
+    float second = bc4_snorm_texel(b + 8, texel);
+    *(device float2 *)(dst + uint64_t(pos.y) * layout.dst_row + pos.x * sizeof(float2)) = float2(value, second);
+  } else
+    *(device float *)(dst + uint64_t(pos.y) * layout.dst_row + pos.x * sizeof(float)) = value;
+}
+
+// the unorm value a BC4 block's index gives, which the hardware's decode of the same block returned
+static float bc4_unorm_of(int index, int e0, int e1) {
+  float a = e0 / 255.0, b = e1 / 255.0;
+  return index == 0 ? a : index == 1 ? b : (e0 > e1) ? ((8 - index) * a + (index - 1) * b) / 7.0
+       : (index < 6) ? ((6 - index) * a + (index - 1) * b) / 5.0
+       : (index == 6 ? 0.0 : 1.0);
+}
+
+// the SNORM value the spec decodes for an index (D3D11.3 19.5.2)
+static float bc4_snorm_of(int index, int e0, int e1) {
+  float a = max(-1.0, (e0 < 128 ? e0 : e0 - 256) / 127.0);
+  float b = max(-1.0, (e1 < 128 ? e1 : e1 - 256) / 127.0);
+  return index == 0 ? a : index == 1 ? b : (e0 > e1) ? ((8 - index) * a + (index - 1) * b) / 7.0
+       : (index < 6) ? ((6 - index) * a + (index - 1) * b) / 5.0
+       : (index == 6 ? -1.0 : 1.0);
+}
+
+// the index whose unorm interpolation the hardware's decode of the same block returned
+static int bc4_index_of(float u, int e0, int e1) {
+  float best_error = 1e30;
+  int best = 0;
+  for (int i = 0; i < 8; i++) {
+    float candidate = bc4_unorm_of(i, e0, e1);
+    float error = fabs(candidate - u);
+    if (error < best_error) {
+      best_error = error;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// the block-compressed resource's raw storage decodes into the companion's float texels: the endpoints
+// come back from the unorm texels at the block's first two slots (a byte survives the unorm roundtrip),
+// each texel's index is the one whose unorm interpolation the hardware's decode returned, and the value
+// is what the spec decodes for that index. one channel per fetch; BC5's green is the second
+[[kernel]] void cs_decode_bc_snorm_texture(
+    texture2d<float> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+    constant uint4 &params [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
+  uint2 block = (pos / 4) * 4;
+  int e0 = int(round(src.read(block + uint2(0, 0)).r * 255.0));
+  int e1 = int(round(src.read(block + uint2(1, 0)).r * 255.0));
+#ifdef MULLION_BC_GRID_DEBUG
+  dst.write(float(pos.x), pos);
+  return;
+#endif
+  float value = bc4_snorm_of(bc4_index_of(src.read(pos).r, e0, e1), e0, e1);
+  if (params.z) {
+    int g0 = int(round(src.read(block + uint2(0, 0)).g * 255.0));
+    int g1 = int(round(src.read(block + uint2(1, 0)).g * 255.0));
+    float second = bc4_snorm_of(bc4_index_of(src.read(pos).g, g0, g1), g0, g1);
+    dst.write(value, pos);
+    // the green channel of a BC5_SNORM companion writes through its own view
+  } else
+    dst.write(value, pos);
+}
+
 [[kernel]] void cs_unpack_d24(
     device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
     constant uint2 &pitches [[buffer(2)]], uint2 pos [[thread_position_in_grid]]) {
@@ -1615,7 +1745,7 @@ static void ray_trace(thread MullionRayContext &parent, thread SM50_RAY_TRACE &t
     uint2 pos [[thread_position_in_grid]]) {
   auto texel = buffer + ulong(pos.y) * pitches.x + pos.x * sizeof(uint);
   float depth = *(device const float *)texel;
-  *(device uint *)texel = uint(round(kD24UnormMax * clamp(depth, 0.0f, 1.0f)));
+  *(device uint *)texel = pack_d24(depth);
 }
 
 // the samples of a depth attachment whose depth is in the bounds, a bit each in a byte for each pixel, for the depth

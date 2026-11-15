@@ -25,7 +25,7 @@ pixel(UINT frame, UINT row, UINT byte, DXGI_FORMAT format) {
 static int
 child(const char *directory_mode) {
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   if (directory_mode) {
     ComPtr<IUnknown> debug;
     D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
@@ -172,6 +172,10 @@ main(int argc, char **argv) {
     GetExitCodeProcess(process.hProcess, &status);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    if (waited == WAIT_OBJECT_0 && status == 77) {
+      printf("skipped: the child could not make its Direct3D 12 device\n");
+      return verdict_skipped("the child could not make its Direct3D 12 device");
+    }
     expect(waited == WAIT_OBJECT_0 && status == 0, "child ended with %lu after wait %lu", status, waited);
     const UINT begin = range && (!strcmp(range, "0:1") || range == all) ? 0 : first;
     const UINT selected = directory_mode || !range ? 0 : range == requested ? count : range == all ? frames

@@ -35,6 +35,8 @@
 #include <fstream>
 #include <mutex>
 #include <array>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <deque>
 #include <variant>
@@ -327,6 +329,25 @@ MTLD3D12PipelineState::Name(std::initializer_list<D3D12_SHADER_BYTECODE> Shaders
     DumpShaders(Shaders);
 }
 
+namespace {
+
+std::mutex intern_mutex;
+std::unordered_map<std::string, std::pair<sm50_shader_t, MTL_SHADER_REFLECTION>> interned_parses;
+std::unordered_set<uint64_t> interned_ids;
+
+uint64_t
+shader_id(sm50_shader_t shader) {
+  return (uint64_t)shader;
+}
+
+} // namespace
+
+bool
+SM50ShaderIsInterned(sm50_shader_t shader) {
+  std::lock_guard<std::mutex> lock(intern_mutex);
+  return interned_ids.count(shader_id(shader)) != 0;
+}
+
 HRESULT
 MTLD3D12PipelineState::InitializeShader(
     MTLD3D12Device *Device, D3D12_SHADER_BYTECODE Bytecode, sm50_shader_t *ppShader, struct MTL_SHADER_REFLECTION *pRefl
@@ -336,14 +357,33 @@ MTLD3D12PipelineState::InitializeShader(
       !ShaderFeaturesSupported(Device, Bytecode.pShaderBytecode, Bytecode.BytecodeLength))
     return FAIL(E_INVALIDARG);
 
+  const auto hash = Sha1HashState::compute(Bytecode.pShaderBytecode, Bytecode.BytecodeLength).string();
+  {
+    std::lock_guard<std::mutex> lock(intern_mutex);
+    auto it = interned_parses.find(hash);
+    if (it != interned_parses.end()) {
+      *ppShader = it->second.first;
+      if (pRefl)
+        *pRefl = it->second.second;
+      return S_OK;
+    }
+  }
+
   SM50Error error;
-  if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl, &error)) {
+  MTL_SHADER_REFLECTION reflection{};
+  if (SM50Initialize(Bytecode.pShaderBytecode, Bytecode.BytecodeLength, ppShader, pRefl ? pRefl : &reflection, &error)) {
     ERR(
-        "Failed to initialize shader ", Sha1HashState::compute(Bytecode.pShaderBytecode, Bytecode.BytecodeLength).string(),
+        "Failed to initialize shader ", hash,
         ": ", SM50GetErrorMessageString(error)
     );
     DumpShaders({Bytecode});
     return FAIL(E_INVALIDARG);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(intern_mutex);
+    interned_parses.emplace(hash, std::make_pair(*ppShader, pRefl ? *pRefl : reflection));
+    interned_ids.insert(shader_id(*ppShader));
   }
 
   return S_OK;
@@ -479,10 +519,10 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_PIXEL_SHADER: {
       auto &[next, type, mask, dual, depth, unorm, formats, statistics, coverage, centered, single, paired, clips,
-             culls, cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull] =
-          *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
+             culls, cull_depth, blend, bounds, late, conservative, coarse, rate, quads, hull, depth_bits, diamond,
+             plane] = *(SM50_SHADER_PSO_PIXEL_SHADER_DATA *)arg;
       hash(mask, dual, depth, unorm, formats, statistics, coverage, centered, single, paired, clips, culls, cull_depth,
-           blend, bounds, late, conservative, coarse, rate, quads, hull);
+           blend, bounds, late, conservative, coarse, rate, quads, hull, depth_bits, diamond, plane);
       break;
     }
     case SM50_SHADER_IA_INPUT_LAYOUT: {
@@ -496,9 +536,9 @@ CompileFunction(
     }
     case SM50_SHADER_PSO_GEOMETRY_SHADER: {
       auto &[next, type, strip, cut, index, primitive, pass, statistics, clips, culls, quads, barycentrics, conservative,
-             flat, noperspective, mesh_only, hull, inner] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
+             flat, noperspective, mesh_only, hull, inner, diamond, depth_max, plane] = *(SM50_SHADER_PSO_GEOMETRY_SHADER_DATA *)arg;
       hash(strip, cut, index, primitive, pass, statistics, clips, culls, quads, barycentrics, conservative, flat,
-           noperspective, mesh_only, hull, inner);
+           noperspective, mesh_only, hull, inner, diamond, depth_max, plane);
       break;
     }
     case SM50_SHADER_GS_PASS_THROUGH: {
@@ -1408,12 +1448,8 @@ public:
 
     bool tessellation = pDesc->HS.pShaderBytecode;
     // stream output runs through the geometry pipeline, with or without a geometry shader; after a tessellator the
-    // geometry shader runs in the tessellation pipeline's mesh stage
+    // geometry shader and stream output run in the tessellation pipeline's mesh stage
     geometry_shader = !tessellation && (pDesc->GS.pShaderBytecode || stream_output);
-    if (tessellation && stream_output) {
-      ERR("CreatePipelineState: stream output of a tessellated draw is not implemented yet");
-      return E_NOTIMPL;
-    }
     if (tessellation != !!pDesc->DS.pShaderBytecode)
       return FAIL(E_INVALIDARG);
 
@@ -1469,8 +1505,8 @@ public:
     if (pDesc->GS.pShaderBytecode && FAILED(hr = InitializeShader(device_, pDesc->GS, &shader_gs, &ref_gs)))
       return hr;
     gs_instances = sm50_shader_t(shader_gs) ? ref_gs.GeometryShader.InstanceCount : 1;
-    // the stage before stream output and the rasterizer: the geometry shader, or the vertex shader
-    auto last_stage = pDesc->GS.pShaderBytecode ? pDesc->GS : pDesc->VS;
+    // the stage before stream output and the rasterizer: the geometry shader, the domain shader, or the vertex shader
+    auto last_stage = pDesc->GS.pShaderBytecode ? pDesc->GS : tessellation ? pDesc->DS : pDesc->VS;
     std::vector<SM50_STREAM_OUTPUT_ELEMENT2> so_elements;
     SM50_SHADER_STREAM_OUTPUT_DATA so_data{};
     if (stream_output) {
@@ -1510,7 +1546,8 @@ public:
     // slice where the shader writes resources
     bool mesh_grows = mesh_shader && ref_ms.MeshConservativeTriangles;
     auto tessellated = microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(tessellation ? ref_hs.Tessellator.OutputPrimitive : 0);
-    bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode &&
+    // stream output takes a domain shader's primitives one at a time, as a geometry shader would
+    bool domain_grows = tessellation && !pDesc->GS.pShaderBytecode && !stream_output &&
                         (tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CW ||
                          tessellated == microsoft::D3D11_SB_TESSELLATOR_OUTPUT_TRIANGLE_CCW) &&
                         dxbc::tessellation_pieces(
@@ -1656,7 +1693,10 @@ public:
 
       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
 
-      SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
+      // zeroed: depth_unorm_bits, diamond_lines and plane_slope are never set here (the geometry pipeline's mesh
+      // stage writes none of the line's own varyings), and garbage in them once made the pixel function read
+      // mullion_line_a/b the mesh stage does not write, so Metal refused the pipeline
+      SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps = {};
       data_ps.dual_source_blending = dual_source_blending;
       data_ps.disable_depth_output =
           (mesh ? mesh_info.depth_pixel_format : info.depth_pixel_format) == WMTPixelFormatInvalid;
@@ -1911,38 +1951,51 @@ public:
       pso_tess.flat_inputs = pixel_shader ? ref_ps.PixelShader.FlatInputs : 0;
       pso_tess.noperspective_inputs = pixel_shader ? ref_ps.PixelShader.NoPerspectiveInputs : 0;
       pso_tess.barycentrics = conservative && pixel_shader && ref_ps.PixelShader.Barycentrics;
-      pso_tess.next = &clip_data;
-      mesh_info.fragment_function = ps_func.handle;
-      mesh_info.rasterization_enabled = true;
+      // stream output after a tessellator: a pass counts each patch group's primitives, then one writes them in
+      // order and draws (SM50_STREAM_OUTPUT_TARGETS)
+      SM50_SHADER_STREAM_OUTPUT_DATA so_tess = so_data;
+      so_tess.next = &clip_data;
+      pso_tess.next = stream_output ? (void *)&so_tess : (void *)&clip_data;
+      bool unrasterized = stream_output && so_data.rasterized_stream == ~0u;
       // the vertex and hull stages run 32 threads per object threadgroup, the domain stage 32 per mesh threadgroup
       mesh_info.mesh_tgsize_is_multiple_of_sgwidth = true;
       mesh_info.object_tgsize_is_multiple_of_sgwidth = true;
       threads_per_patch = ref_hs.ThreadsPerPatch;
 
-      auto build = [&]() -> HRESULT {
-        // a geometry shader's primitives each take a mesh threadgroup; a grid has as many as the device lets it, and
-        // the object threadgroups of several grids share a patch group's
+      auto build = [&](bool counting) -> HRESULT {
+        so_tess.counting = counting;
+        bool rasterized = !counting && !unrasterized;
+        mesh_info.fragment_function = rasterized ? ps_func.handle : obj_handle_t{};
+        mesh_info.rasterization_enabled = rasterized;
+        // a geometry shader's primitives, or stream output's, each take a mesh threadgroup; a grid has as many as the
+        // device lets it, and the object threadgroups of several grids share a patch group's
         pso_tess.max_mesh_threadgroups = device_->max_mesh_threadgroups;
         auto partitioning = microsoft::D3D11_SB_TESSELLATOR_PARTITIONING(ref_hs.Tessellator.Partition);
         auto domain = microsoft::D3D11_SB_TESSELLATOR_DOMAIN(ref_hs.Tessellator.Domain);
         auto factor = dxbc::get_final_factor(ref_hs.Tessellator.MaxFactor, partitioning, pso_tess.max_potential_tess_factor).second;
         bool geometry = sm50_shader_t(shader_gs);
+        uint32_t workloads = dxbc::get_max_potential_workload_count(factor, domain, partitioning) * (32 / threads_per_patch);
+        uint32_t primitives = dxbc::get_max_workload_vertices(factor, domain);
+        uint32_t instances = geometry ? ref_gs.GeometryShader.InstanceCount : 1;
         tessellation_parts = dxbc::tessellation_grids(
-                                 dxbc::get_max_potential_workload_count(factor, domain, partitioning) * (32 / threads_per_patch),
-                                 geometry ? dxbc::get_max_workload_vertices(factor, domain)
-                                          : dxbc::tessellation_pieces(
-                                                factor, domain,
-                                                microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(ref_hs.Tessellator.OutputPrimitive),
-                                                pso_tess.mesh_vertex_size, pso_tess.conservative
-                                            ).count,
-                                 geometry ? ref_gs.GeometryShader.InstanceCount : 1, pso_tess.max_mesh_threadgroups
+                                 workloads,
+                                 geometry || stream_output
+                                     ? primitives
+                                     : dxbc::tessellation_pieces(
+                                           factor, domain,
+                                           microsoft::D3D11_SB_TESSELLATOR_OUTPUT_PRIMITIVE(ref_hs.Tessellator.OutputPrimitive),
+                                           pso_tess.mesh_vertex_size, pso_tess.conservative
+                                       ).count,
+                                 instances, pso_tess.max_mesh_threadgroups
         ).parts;
+        so_workloads = workloads;
+        so_counts = dxbc::tessellation_stream_output_counts(workloads, primitives, instances, geometry);
         SM50_SHADER_ROOT_SIGNATURE_DATA rootsig_ds, rootsig_gs;
         root_signature(rootsig_gs, &pso_tess);
         rootsig_gs.type = SM50_SHADER_ROOT_SIGNATURE2;
         auto args_ds = root_signature(rootsig_ds, &rootsig_gs);
         auto ds_func = CompileFunction(
-            device_, this, std::array{pDesc->HS, pDesc->DS, pDesc->GS}, args_ds, "ds_main",
+            device_, this, std::array{pDesc->HS, pDesc->DS, pDesc->GS}, args_ds, counting ? "ds_count" : "ds_main",
             [&](auto args, auto name, auto bitcode, auto error) {
               return SM50CompileTessellationPipelineDomain(shader_hs, shader_ds, args, name, bitcode, error);
             }
@@ -1959,7 +2012,7 @@ public:
         rootsig_vs.type = SM50_SHADER_ROOT_SIGNATURE2;
         auto args_hs = root_signature(rootsig_hs, &rootsig_vs);
         auto vshs_func = CompileFunction(
-            device_, this, std::array{pDesc->VS, pDesc->HS, pDesc->GS}, args_hs, "vshs_main",
+            device_, this, std::array{pDesc->VS, pDesc->HS, pDesc->GS}, args_hs, counting ? "vshs_count" : "vshs_main",
             [&](auto args, auto name, auto bitcode, auto error) {
               return SM50CompileTessellationPipelineHull(shader_vs, shader_hs, args, name, bitcode, error);
             }
@@ -1967,20 +2020,26 @@ public:
         if (!vshs_func)
           return FAIL(E_INVALIDARG);
         mesh_info.object_function = vshs_func.handle;
-        pipeline_descriptors_.erase(pso.handle);
-        if (!(pso = CreatePipeline(mesh_info, err))) {
+        auto &built = counting ? so_count : pso;
+        pipeline_descriptors_.erase(built.handle);
+        if (!(built = CreatePipeline(mesh_info, err))) {
           ERR("Failed to create tessellation PSO of shaders ", name, ": ", err.description().getUTF8String());
           DumpShaders({pDesc->VS, pDesc->HS, pDesc->DS, pDesc->GS, pDesc->PS});
           return E_FAIL;
         }
         return S_OK;
       };
-      if (FAILED(hr = build()))
+      auto build_all = [&]() -> HRESULT {
+        if (stream_output && FAILED(hr = build(true)))
+          return hr;
+        return build(false);
+      };
+      if (FAILED(hr = build_all()))
         return hr;
       // only a pipeline tells what a grid may have: the device's first is built to ask, then built for it
       if (!pso_tess.max_mesh_threadgroups) {
         device_->max_mesh_threadgroups = std::min<uint64_t>(pso.maxTotalThreadgroupsPerMeshGrid(), UINT32_MAX);
-        if (FAILED(hr = build()))
+        if (FAILED(hr = build_all()))
           return hr;
       }
     }

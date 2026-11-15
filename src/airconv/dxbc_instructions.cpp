@@ -199,9 +199,12 @@ auto readSrcOperandSwizzle(const microsoft::D3D10ShaderBinary::COperandBase &O
     };
   }
   case D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE: {
-    DXASSERT_DXBC(false && "can not read swizzle from mask");
-    // DXASSERT_DXBC(O.m_WriteMask >> 4 == 0b1111);
-    // return swizzle_identity;
+    // a source operand written in mask mode carries no swizzle: the mask names the components the operand is read
+    // through, and the instruction's destination write mask decides which of them are written (D3D10TokenizedProgram-
+    // Format.hpp, D3D10_SB_OPERAND_4_COMPONENT_MASK_MODE, whose decoder reads m_WriteMask and leaves m_Swizzle unset;
+    // D3D12TranslationLayer's ShaderBinary.cpp decodes it the same way). Reading it identity is therefore the operand's
+    // own components; refusing it failed Wine visual's crafted ps_2_0 whose mov reads t0 in mask mode.
+    return swizzle_identity;
   }
   }
   Refuse("a swizzle read from a mask");

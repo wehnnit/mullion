@@ -9,15 +9,19 @@
 #include "assert.h"
 #include "string.h"
 
-#ifdef NDEBUG
-#define UNIX_CALL(code, params) WINE_UNIX_CALL(code, params)
-#else
+#include <stdio.h>
+#include <stdlib.h>
+
+// a failed unix dispatch must not leave the caller's outs as they were on the stack: thunks initialize those
+// fields, and a nonzero NTSTATUS is reported in every build (release used to discard it)
 #define UNIX_CALL(code, params)                                                                                        \
-  {                                                                                                                    \
+  do {                                                                                                                 \
     NTSTATUS status = WINE_UNIX_CALL(code, params);                                                                    \
-    assert(!status && "unix call failed");                                                                             \
-  }
-#endif
+    if (status) {                                                                                                      \
+      fprintf(stderr, "winemetal: unix call %u failed %#x\n", (unsigned)(code), (unsigned)status);                      \
+      assert(!status && "unix call failed");                                                                           \
+    }                                                                                                                  \
+  } while (0)
 
 #define PtrToUInt64(v) ((uint64_t)(uintptr_t)(v))
 
@@ -2277,6 +2281,38 @@ MTLDevice_newDenoisedScaler(obj_handle_t device, const struct WMTFXDenoisedScale
   params.metal4 = metal4;
   UNIX_CALL(WMTUnixDeviceNewDenoisedScaler, &params);
   return params.ret;
+}
+
+WINEMETAL_API bool
+MTLDevice_supportsFXFrameInterpolator(obj_handle_t device, bool metal4) {
+  struct unixcall_generic_obj_uint64_uint64_ret params;
+  params.handle = device;
+  params.arg = metal4;
+  params.ret = 0;
+  UNIX_CALL(WMTUnixDeviceSupportsFXFrameInterpolator, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newFrameInterpolator(obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info, bool metal4) {
+  struct unixcall_mtldevice_newframeinterpolator params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = NULL_OBJECT_HANDLE;
+  params.metal4 = metal4;
+  UNIX_CALL(WMTUnixDeviceNewFrameInterpolator, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_encodeFrameInterpolation(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, const struct WMTFXFrameInterpolateArgs *args
+) {
+  struct unixcall_mtlcommandbuffer_interpolate_frame params;
+  params.cmdbuf = cmdbuf;
+  params.interpolator = interpolator;
+  WMT_MEMPTR_SET(params.args, args);
+  UNIX_CALL(WMTUnixCommandBufferEncodeFrameInterpolation, &params);
 }
 
 WINEMETAL_API void

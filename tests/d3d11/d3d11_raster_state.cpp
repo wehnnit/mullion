@@ -240,6 +240,14 @@ int main() {
       expect(count == 1 && !memcmp(&got, &valid, sizeof(valid)), "negative origin accepted at level %#x", level);
     }
   }
+  // The forced counts 0, 1, 2, 4 and 8 are the documented value domain and 16 is optional (Microsoft Learn,
+  // D3D11_RASTERIZER_DESC1::ForcedSampleCount). Whether a device whose GPU cannot rasterize 8 samples must still
+  // *accept* a forced count of 8 -- and what it then does at draw time -- is not answered by that page, and this
+  // build's two answers already agree with each other: CreateRasterizerState2 and CheckMultisampleQualityLevels both
+  // gate on MTLDevice.supportsTextureSampleCount (d3d11_state_object.cpp:640-643, d3d11_device.cpp:1182-1191), which is
+  // what CODE.md 2.2 asks for. So the case stays as written, known-red, and is settled by an observation on Windows --
+  // not by changing the expectation to what this build does, and not by changing the build to what the test assumes.
+  // docs/MULLION_REQUIREMENTS.md, "host and misc".
   step("forced sample count validation");
   for (UINT count : {0u, 1u, 2u, 4u, 8u}) {
     D3D11_RASTERIZER_DESC2 desc{};

@@ -743,6 +743,9 @@ public:
             auto [buffer_alloc, offset] = enc.access(buffer, slice.byteOffset, slice.byteLength, ResourceAccess::Write);
             enc.emulated_cmd.ClearBufferUint(buffer_alloc->buffer(), slice.byteOffset + offset, slice.byteLength >> 2, value);
           } else {
+            // the view was already replaced by the unsigned format of the typed view above, and `typed` is that
+            // view's own format: integer clears copy the value's channel bits as the typed view sees them
+            // (D3D11.3 5.2.3.2), so the write goes through the unsigned view and the colour is composed for the typed.
             auto [view, first] = enc.accessView(buffer, viewId, ResourceAccess::Write, slice.firstElement);
             enc.emulated_cmd.ClearTextureBufferUint(
                 view.texture, first, slice.elementCount, ClearUAV<ArgumentEncodingContext>::clearColor(value, typed)
@@ -1192,6 +1195,12 @@ public:
       break;
     }
     }
+    if (auto dst = GetTexture(pDstResource))
+      if (auto src = GetTexture(pSrcResource); src && !src->bc_mips.empty()) {
+        dst->bc_mips = src->bc_mips;
+        if (dst->bc_snorm)
+          RefreshBcSnormCompanion(dst.ptr(), device);
+      }
   }
 
   void
@@ -5494,7 +5503,37 @@ public:
       return false;
     auto VS = GetManagedShader<PipelineStage::Vertex>();
     return is_adjacency_topology(state_.InputAssembler.Topology) || (VS && VS->reflection().CullDistances) ||
-           QuadLines();
+           QuadLines() || DiamondLines();
+  }
+
+  // float depth bias's unit is 2^(exponent of the greatest |window z| in the primitive - 23). only the mesh stage
+  // sees every vertex, so the triangle is passed through and that maximum goes to the depth shader
+  bool
+  DepthBiasPrimitiveMax() {
+    if (GetManagedShader<PipelineStage::Geometry>() || GetManagedShader<PipelineStage::Pixel>() ||
+        state_.ShaderStages[PipelineStage::Hull].Shader || !state_.OutputMerger.DSV ||
+        state_.OutputMerger.DSV->depthUnormBits())
+      return false;
+    if (to_metal_primitive_topology(state_.InputAssembler.Topology) != WMTPrimitiveTopologyClassTriangle)
+      return false;
+    auto rs = state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+    D3D11_RASTERIZER_DESC bias{};
+    rs->GetDesc(&bias);
+    return bias.DepthBias != 0 || bias.SlopeScaledDepthBias != 0.f || bias.DepthBiasClamp != 0.f;
+  }
+
+  // wireframe draws the edges, so a pixel shader's derivatives are the edge's. slope bias is the triangle's (15.10),
+  // which the mesh stage can see and writes flat for the shader
+  bool
+  PlaneSlope() {
+    if (GetManagedShader<PipelineStage::Hull>() || !GetManagedShader<PipelineStage::Pixel>() || state_.OutputMerger.DSV)
+      return false;
+    if (to_metal_primitive_topology(state_.InputAssembler.Topology) != WMTPrimitiveTopologyClassTriangle)
+      return false;
+    auto rs = state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+    D3D11_RASTERIZER_DESC bias{};
+    rs->GetDesc(&bias);
+    return bias.FillMode == D3D11_FILL_WIREFRAME && bias.SlopeScaledDepthBias != 0.f;
   }
 
   // the topology's lines are quadrilaterals, which the mesh stage makes (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
@@ -5504,8 +5543,18 @@ public:
     auto primitive = to_input_primitive(state_.InputAssembler.Topology);
     return rs->QuadrilateralLines() && (primitive == D3D_PRIMITIVE_LINE || primitive == D3D_PRIMITIVE_LINE_ADJ);
   }
+  // aliased lines (MultisampleEnable off) are tested with the diamond-exit rule, not Metal's lines
+  bool
+  DiamondLines() {
+    auto rs = state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+    auto primitive = to_input_primitive(state_.InputAssembler.Topology);
+    return !rs->QuadrilateralLines() && (primitive == D3D_PRIMITIVE_LINE || primitive == D3D_PRIMITIVE_LINE_ADJ);
+  }
   // whether the current pipeline draws lines as triangles, which the rasterizer state then takes as lines
   bool quad_lines_ = false;
+  // a depth-only draw applies D3D's bias in the fragment shader, so Metal's bias stays 0
+  bool depth_fix_ = false;
+  bool depth_max_ = false;
   // the pipeline's pixel shader blends a target itself, reading the blend factor after the depth ranges (ShaderBlend)
   bool shader_blend_ = false;
 
@@ -5567,6 +5616,7 @@ public:
     Desc.BlendState = state_.OutputMerger.BlendState ? state_.OutputMerger.BlendState : default_blend_state;
     Desc.DepthStencilFormat =
         state_.OutputMerger.DSV ? state_.OutputMerger.DSV->pixelFormat() : WMTPixelFormatInvalid;
+    Desc.DepthUnormBits = state_.OutputMerger.DSV ? state_.OutputMerger.DSV->depthUnormBits() : 0;
     Desc.TopologyClass = to_metal_primitive_topology(state_.InputAssembler.Topology);
     bool ds_enabled =
         (state_.OutputMerger.DepthStencilState ? state_.OutputMerger.DepthStencilState : default_depth_stencil_state)
@@ -5612,11 +5662,20 @@ public:
                                   Desc.PixelShader->reflection().PixelShader.HasCoverageInput)
                              ? last->reflection().ClipDistances
                              : 0;
+    bool depth_max = DepthBiasPrimitiveMax();
+    Desc.DepthMax = depth_max;
+    auto gs = GetManagedShader<PipelineStage::Geometry>();
+    Desc.PlaneSlope = PlaneSlope();
     Desc.PassThrough =
-        !so_raster_pass_ && (PassesPrimitivesThrough() || (IndexedDraw && !state_.InputAssembler.IndexBuffer));
+        !so_raster_pass_ && (PassesPrimitivesThrough() || depth_max || (Desc.PlaneSlope && !gs) ||
+                             (IndexedDraw && !state_.InputAssembler.IndexBuffer));
     Desc.InputPrimitive = !GS && (Desc.SOLayout || Desc.PassThrough) ? to_input_primitive(state_.InputAssembler.Topology) : 0;
-    Desc.QuadLines = !GS && Desc.PassThrough && QuadLines();
-    if (std::exchange(quad_lines_, Desc.QuadLines) != Desc.QuadLines)
+    Desc.QuadLines = QuadLines();
+    Desc.DiamondLines = DiamondLines();
+    if (std::exchange(quad_lines_, Desc.QuadLines || Desc.DiamondLines) != quad_lines_)
+      dirty_state.set(DirtyState::RasterizerState);
+    bool depth_fix = !Desc.PixelShader && Desc.DepthStencilFormat != WMTPixelFormatInvalid;
+    if (std::exchange(depth_fix_, depth_fix) != depth_fix)
       dirty_state.set(DirtyState::RasterizerState);
     // which targets the pipeline's pixel shader blends itself (ShaderBlend)
     WMTRenderPipelineBlendInfo blend{};
@@ -5783,13 +5842,18 @@ public:
     }
     if (IndexedDraw && !state_.InputAssembler.IndexBuffer)
       return FinalizeGeometryRenderPipeline<IndexedDraw>();
-    if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
-      return DrawCallStatus::Ordinary;
+    // the bound pipeline is ordinary or a mesh depending on whether this draw's bias needs the primitive maximum,
+    // or its wireframe slope needs the triangle plane. checked before an ordinary pipeline is reused
+    bool depth_max = DepthBiasPrimitiveMax() || (PlaneSlope() && !GetManagedShader<PipelineStage::Geometry>());
+    if (std::exchange(depth_max_, depth_max) != depth_max)
+      InvalidateRenderPipeline();
     auto GS = GetManagedShader<PipelineStage::Geometry>();
     if ((StreamOutputLayout() && !so_raster_pass_) || (GS && GS->reflection().GeometryShader.GSPassThrough == ~0u) ||
-        PassesPrimitivesThrough()) {
+        PassesPrimitivesThrough() || depth_max) {
       return FinalizeGeometryRenderPipeline<IndexedDraw>();
     }
+    if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
+      return DrawCallStatus::Ordinary;
 
     if (!SwitchToRenderEncoder()) {
       return DrawCallStatus::Invalid;
@@ -5870,12 +5934,40 @@ public:
     if (dirty_state.any(DirtyState::RasterizerState)) {
       IMTLD3D11RasterizerState *state =
           state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
-      EmitST([state, lines = quad_lines_](ArgumentEncodingContext& enc) {
+      EmitST([state, lines = quad_lines_, shader_bias = depth_fix_ || !state_.OutputMerger.DSV.ptr()](ArgumentEncodingContext& enc) {
         auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setrasterizerstate>();
         cmd.type = WMTRenderCommandSetRasterizerState;
         state->SetupRasterizerState(cmd);
         if (lines)
           RasterizeAsLines(cmd);
+        // no depth attachment: the pixel shader applies 15.10 itself. a depth-only draw does too, in its stand-in
+        // shader. Metal's bias would be a second copy, and it clamps to [0,1] rather than the viewport
+        if (shader_bias)
+          cmd.depth_bias = cmd.scole_scale = cmd.depth_bias_clamp = 0;
+      });
+    }
+    {
+      IMTLD3D11RasterizerState *rs =
+          state_.Rasterizer.RasterizerState ? state_.Rasterizer.RasterizerState.ptr() : default_rasterizer_state;
+      D3D11_RASTERIZER_DESC rd{};
+      rs->GetDesc(&rd);
+      auto topo = to_metal_primitive_topology(state_.InputAssembler.Topology);
+      auto bias = AllocateCommandData<float>(8);
+      bias[0] = float(rd.DepthBias);
+      bias[1] = rd.SlopeScaledDepthBias;
+      bias[2] = rd.DepthBiasClamp;
+      bias[3] = float(state_.OutputMerger.DSV ? state_.OutputMerger.DSV->depthUnormBits() : 0);
+      bias[4] = topo == WMTPrimitiveTopologyClassTriangle ? 1.f : 0.f;
+      bias[5] = 0;
+      bool set = state_.Rasterizer.NumViewports != 0;
+      bias[6] = set ? state_.Rasterizer.viewports[0].MinDepth : 0;
+      bias[7] = set ? state_.Rasterizer.viewports[0].MaxDepth : 1;
+      EmitST([bias = std::move(bias)](ArgumentEncodingContext &enc) {
+        auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setbytes>();
+        cmd.type = WMTRenderCommandSetFragmentBytes;
+        cmd.bytes.set(bias.data());
+        cmd.length = bias.span().size_bytes();
+        cmd.index = SM50_BINDING_INDEX_DEPTH_BIAS;
       });
     }
     if (dirty_state.any(DirtyState::BlendFactorAndStencilRef)) {
@@ -5939,13 +6031,25 @@ public:
       });
     }
     if (dirty_state.any(DirtyState::Viewport)) {
-      auto raster_scale = AllocateCommandData<float>(1 + 2 * SM50_VIEWPORTS);
+      auto raster_scale = AllocateCommandData<float>(SM50_RASTER_SCALE_VIEWPORT_WORDS);
       raster_scale[0] = scale;
+      for (unsigned w = SM50_RASTER_SCALE_MESH_ORIGIN; w < SM50_RASTER_SCALE_VIEWPORT; w++)
+        raster_scale[w] = 0;
+      // the line mesh clips against z where the rasterizer does (D3D11.3 15.6). the word is the mesh-group origin,
+      // which a d3d11 draw does not read
+      D3D11_RASTERIZER_DESC rs_desc{};
+      current_rs->GetDesc(&rs_desc);
+      raster_scale[SM50_RASTER_SCALE_MESH_ORIGIN] = rs_desc.DepthClipEnable ? 1.f : 0.f;
       for (unsigned i = 0; i < SM50_VIEWPORTS; i++) {
         auto &d3dViewport = state_.Rasterizer.viewports[i < state_.Rasterizer.NumViewports ? i : 0];
         // with no viewport set, Metal's covers the pass
-        raster_scale[1 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Width : render_pass_width_;
-        raster_scale[2 + 2 * i] = state_.Rasterizer.NumViewports ? d3dViewport.Height : render_pass_height_;
+        bool set = state_.Rasterizer.NumViewports != 0;
+        raster_scale[1 + 2 * i] = set ? d3dViewport.Width : render_pass_width_;
+        raster_scale[2 + 2 * i] = set ? d3dViewport.Height : render_pass_height_;
+        raster_scale[SM50_RASTER_SCALE_VIEWPORT + 4 * i + 0] = set ? d3dViewport.TopLeftX : 0;
+        raster_scale[SM50_RASTER_SCALE_VIEWPORT + 4 * i + 1] = set ? d3dViewport.TopLeftY : 0;
+        raster_scale[SM50_RASTER_SCALE_VIEWPORT + 4 * i + 2] = set ? d3dViewport.MinDepth : 0;
+        raster_scale[SM50_RASTER_SCALE_VIEWPORT + 4 * i + 3] = set ? d3dViewport.MaxDepth : 1;
       }
       EmitST([raster_scale = std::move(raster_scale)](ArgumentEncodingContext &enc) {
         for (auto stage : {WMTRenderCommandSetVertexBytes, WMTRenderCommandSetMeshBytes}) {

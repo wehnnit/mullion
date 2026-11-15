@@ -19,3 +19,7 @@ releases
 prefixes
 .crashdata
 settings.ini
+/build*-fault*/
+/install*/
+__pycache__/
+*.pyc

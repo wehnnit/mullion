@@ -428,8 +428,11 @@ public:
     uint32_t dstModeId = 0;
 
     std::vector<DXGI_MODE_DESC1> modeList;
+    // Wine/macOS EnumDisplaySettings can report a very large or non-terminating mode list; cap enumeration so
+    // FindClosestMatchingMode1 cannot hang the DXGI conformance suite.
+    constexpr uint32_t kMaxEnumModes = 256;
 
-    while (wsi::getDisplayMode(monitor_, srcModeId++, &devMode)) {
+    while (srcModeId < kMaxEnumModes && wsi::getDisplayMode(monitor_, srcModeId++, &devMode)) {
       // Only enumerate interlaced modes if requested.
       if (devMode.interlaced && !(Flags & DXGI_ENUM_MODES_INTERLACED))
         continue;
@@ -486,15 +489,17 @@ public:
   FindClosestMatchingMode1(const DXGI_MODE_DESC1 *pModeToMatch,
                            DXGI_MODE_DESC1 *pClosestMatch,
                            IUnknown *pConcernedDevice) final {
+    // Silent DXGI_ERROR_INVALID_CALL: Wine dxgi.c hammers these validation paths per enumerated mode;
+    // FAIL() logging made the suite appear hung under Wine on macOS.
     if (!pModeToMatch || !pClosestMatch)
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return DXGI_ERROR_INVALID_CALL;
 
     if (pModeToMatch->Format == DXGI_FORMAT_UNKNOWN && !pConcernedDevice)
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return DXGI_ERROR_INVALID_CALL;
 
     // Both or neither must be zero
     if ((pModeToMatch->Width == 0) ^ (pModeToMatch->Height == 0))
-      return FAIL(DXGI_ERROR_INVALID_CALL);
+      return DXGI_ERROR_INVALID_CALL;
 
     wsi::WsiMode activeWsiMode = {};
     wsi::getCurrentDisplayMode(monitor_, &activeWsiMode);

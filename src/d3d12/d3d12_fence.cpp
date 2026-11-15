@@ -58,13 +58,14 @@ private:
   size_t swept_ = 16;
 
   Watcher() {
-    auto wait = CreateThreadpoolWait(
-        [](PTP_CALLBACK_INSTANCE, void *context, PTP_WAIT wait, TP_WAIT_RESULT) {
-          static_cast<Watcher *>(context)->Look(wait);
-        },
-        this, nullptr
-    );
+    auto wait = CreateThreadpoolWait(&WaitCallback, this, nullptr);
     SetThreadpoolWait(wait, reached, nullptr);
+  }
+
+  // a static member with CALLBACK's calling convention: on 32 bits a lambda's is not the one PTP_WAIT_CALLBACK takes
+  static void CALLBACK
+  WaitCallback(PTP_CALLBACK_INSTANCE, void *context, PTP_WAIT wait, TP_WAIT_RESULT) {
+    static_cast<Watcher *>(context)->Look(wait);
   }
 
   void Look(PTP_WAIT wait);

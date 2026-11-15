@@ -215,7 +215,15 @@ CaptureState::frame(WMT::Device device, uint64_t frame) {
     auto fileUrl = env::getUnixPath(directory + env::getExeBaseName() + "_F." + std::to_string(frame) + filename);
     WARN("A new capture of ", capture.frame_count, " frame(s) will be saved to ", fileUrl);
     info.output_url.set(fileUrl.c_str());
-    WMT::CaptureManager::sharedCaptureManager().startCapture(info);
+    // say which happened. before this, the line above named a file whether or not Metal had accepted the capture, so
+    // a log could not tell a captured frame from a refused one, and a refused one still leaves the file behind as a
+    // plausible-looking gap (MTLCaptureManager_startCapture now answers whether it started)
+    if (WMT::CaptureManager::sharedCaptureManager().startCapture(info))
+      WARN("Capture started: Metal is recording ", fileUrl);
+    else
+      WARN("Capture did NOT start: Metal refused this one, so nothing is being recorded to ", fileUrl,
+           ". The bridge says Metal's own reason on stderr and writes it beside the trace as .error.txt; that path "
+           "names a trace that already exists as one reason Metal refuses");
     break;
   }
   case NextAction::StopCapture:
@@ -223,6 +231,9 @@ CaptureState::frame(WMT::Device device, uint64_t frame) {
     capture.stopped_ = false;
     capture.stopping_ = mullion::thread([&capture] {
       WMT::CaptureManager::sharedCaptureManager().stopCapture();
+      // the other half of the pair: without it a log shows a capture starting and never finishing, which reads the
+      // same as a process that hung during one
+      WARN("Capture stopped");
       capture.stopped_ = true;
     });
     break;

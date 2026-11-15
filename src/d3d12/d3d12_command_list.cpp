@@ -25,6 +25,7 @@
 #include "mullion_format.hpp"
 #include "mullion_geometry.hpp"
 #include "mullion_command.hpp"
+#include "tessellation_limits.hpp"
 #include <span>
 #include <cmath>
 #include "util_env.hpp"
@@ -325,6 +326,10 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   // the blit pass before the render pass hoisted_for_ that copies hoisted out of it run in
   BlitEncoderData *hoisted_ = nullptr;
   const EncoderData *hoisted_for_ = nullptr;
+  // the BC4/BC5 resources this list's copies wrote, with the subresources they touched: their SNORM
+  // companions (made here if a view has not) decode where the render pass begins, after the last copy
+  std::vector<std::pair<ID3D12Resource *, std::vector<UINT>>> bc_snorm_copied_;
+
 
   static bool
   HoistsCopies() {
@@ -1610,14 +1615,41 @@ public:
         SM50_BINDING_INDEX_PATCH_SIZE
     );
     EncodeBuffer(WMTRenderCommandSetObjectBuffer, Offset + sizeof(inputs), SM50_BINDING_INDEX_DRAW_ARGUMENTS);
-    auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw>();
-    cmd.type = WMTRenderCommandMullionTessellationMeshDraw;
-    cmd.draw_arguments_offset = Offset + sizeof(inputs);
-    cmd.instance_count = Args.InstanceCount;
-    cmd.threads_per_patch = pso_graphics_->threads_per_patch;
-    cmd.patch_per_group = per_group;
-    cmd.patch_per_mesh_instance = (patches + per_group - 1) / per_group;
-    cmd.parts = pso_graphics_->tessellation_parts;
+    uint32_t warps = (patches + per_group - 1) / per_group;
+    auto draw = [&] {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_mullion_tessellation_mesh_draw>();
+      cmd.type = WMTRenderCommandMullionTessellationMeshDraw;
+      cmd.draw_arguments_offset = Offset + sizeof(inputs);
+      cmd.instance_count = Args.InstanceCount;
+      cmd.threads_per_patch = pso_graphics_->threads_per_patch;
+      cmd.patch_per_group = per_group;
+      cmd.patch_per_mesh_instance = warps;
+      cmd.parts = pso_graphics_->tessellation_parts;
+    };
+    if (!pso_graphics_->stream_output)
+      return draw();
+    // a patch group's object threadgroup is one of stream output's, its workloads' primitives counted apart
+    // (tessellation_stream_output_counts)
+    auto targets = StreamOutputTargets();
+    uint64_t groups = uint64_t(warps) * Args.InstanceCount;
+    auto [Scratch, ScratchOffset] =
+        allocator_->AllocateGPUHeap(SM50StreamOutputScratch(groups, pso_graphics_->so_counts), 16);
+    if (!Scratch)
+      return;
+    targets.scratch = allocator_->gpu_heap_buffer_address_ + ScratchOffset;
+    targets.warps = warps;
+    targets.instances = Args.InstanceCount;
+    auto [Targets, TargetsOffset] = allocator_->AllocateGPUHeap(sizeof(targets), 16);
+    if (allocator_->records_)
+      allocator_->RecordGPUHeap(Targets, sizeof(targets), "stream output targets");
+    memcpy(Targets, &targets, sizeof(targets));
+    StreamOut(TargetsOffset, ScratchOffset, draw, [&] {
+      auto &cmd = allocator_->EncodeRenderCommand<wmtcmd_render_draw>();
+      cmd = {WMTRenderCommandDraw};
+      cmd.primitive_type = WMTPrimitiveTypePoint;
+      cmd.vertex_count = dxbc::tessellation_stream_output_zeroed(groups, pso_graphics_->so_workloads) / sizeof(uint32_t);
+      cmd.instance_count = 1;
+    });
   }
 
   static bool
@@ -2130,6 +2162,100 @@ public:
   // the pass a copy goes in: a blit pass before the open render pass, when no draw in it can have read what the copy
   // writes or written what it reads (a barrier before the pass left the destination a copy's, and the source an
   // upload heap's or a copy's), else a blit pass after what came before. what a resource never named in a barrier is
+  /* a copy wrote a BC4/BC5 resource: its subresource joins the ones the companions decode where the
+   * render pass begins. The companion is made here, so a resource copied before any view of it exists
+   * is decoded all the same */
+  void
+  MarkBcSnormCopied(ID3D12Resource *pResource, UINT Subresource) {
+    auto resource = static_cast<MTLD3D12Resource *>(pResource);
+    if (!resource || !resource->texture)
+      return;
+    MTL_DXGI_FORMAT_DESC format;
+    if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), resource->GetDesc().Format, format)) ||
+        !(format.Flag & MTL_DXGI_FORMAT_BC) ||
+        (format.PixelFormat != WMTPixelFormatBC4_RUnorm && format.PixelFormat != WMTPixelFormatBC5_RGUnorm))
+      return;
+    if (!hoisted_) {
+      // no render pass holds this copy: the companion decodes now, right after the copy's pass
+      if (!BcSnormCompanionOf(resource))
+        return;
+      UINT mips = resource->texture->miplevelCount(), slices = resource->texture->arrayLength();
+      UINT first_level = 0, last_level = mips, first_slice = 0, last_slice = slices;
+      if (Subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+        UINT level = 0, slice = 0, plane = 0;
+        DecomposeSubresource(resource->GetDesc(), Subresource, &level, &slice, &plane);
+        first_level = last_level = level;
+        first_slice = last_slice = slice;
+      }
+      for (UINT slice = first_slice; slice < last_slice; slice++)
+        for (UINT level = first_level; level < last_level; level++)
+          RecordBcSnormCompanionDecode(resource->texture.ptr(), resource->texture->bc_snorm.ptr(), level, slice);
+      return;
+    }
+    for (auto &[copied, subresources] : bc_snorm_copied_)
+      if (copied == pResource) {
+        if (std::find(subresources.begin(), subresources.end(), Subresource) == subresources.end())
+          subresources.push_back(Subresource);
+        return;
+      }
+    bc_snorm_copied_.push_back({pResource, {Subresource}});
+  }
+
+  /* the companion's float texels decode from the raw storage: Metal's own blit gives the blocks to a
+   * buffer, the kernel decodes them into float texels the spec's endpoints give, and a blit puts those
+   * into the companion. three native pieces, no representation of the raw storage is read as texels */
+  void
+  RecordBcSnormCompanionDecode(Texture *raw, Texture *companion, UINT Level, UINT Slice) {
+    uint32_t width = std::max(1u, raw->width() >> Level), height = std::max(1u, raw->height() >> Level);
+    bool rg = raw->pixelFormat() == WMTPixelFormatBC5_RGUnorm;
+    uint32_t block_bytes = rg ? 16 : 8;
+    UINT64 row_bytes = UINT64(align(width, 4) / 4) * block_bytes;
+    UINT64 blocks_image = align(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * align(height, 4) / 4;
+    WMTSize blocks{align(width, 4) / 4, align(height, 4) / 4, 1};
+
+    auto [blocks_buffer, blocks_offset] = allocator_->AllocateTempBuffer(blocks_image, 256);
+    if (!blocks_buffer)
+      return;
+    // Metal's own blit gives the raw blocks to a buffer (the texture is the block format)
+    auto &to_blocks = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer_withblitoption>();
+    to_blocks.type = WMTBlitCommandCopyFromTextureToBufferWithBlitOption;
+    to_blocks.src = raw->current()->texture();
+    to_blocks.level = Level;
+    to_blocks.slice = Slice;
+    to_blocks.origin = {0, 0, 0};
+    to_blocks.size = {width, height, 1};
+    to_blocks.dst = blocks_buffer;
+    to_blocks.offset = blocks_offset;
+    to_blocks.bytes_per_row = align(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    to_blocks.bytes_per_image = blocks_image;
+    to_blocks.options = WMTBlitOptionNone;
+
+    uint32_t texel_bytes = rg ? 8 : 4;
+    UINT64 floats_row = UINT64(width) * texel_bytes;
+    UINT64 floats_image = floats_row * height;
+    auto [floats_buffer, floats_offset] = allocator_->AllocateTempBuffer(floats_image, 256);
+    if (!floats_buffer)
+      return;
+    BCSnormDecodeLayout layout{align(row_bytes, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT), blocks_image, floats_row,
+                               floats_image, width, uint32_t(rg)};
+    allocator_->bc_snorm_decode_.run(blocks_buffer, blocks_offset, floats_buffer, floats_offset, layout,
+                                     {width, height, 1});
+
+    // the decoded floats go into the companion, whose texels the SNORM views read
+    auto &to_companion = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture_withblitoption>();
+    to_companion.type = WMTBlitCommandCopyFromBufferToTextureWithBlitOption;
+    to_companion.src = floats_buffer;
+    to_companion.src_offset = floats_offset;
+    to_companion.bytes_per_row = floats_row;
+    to_companion.bytes_per_image = floats_image;
+    to_companion.size = {width, height, 1};
+    to_companion.dst = companion->current()->texture();
+    to_companion.level = Level;
+    to_companion.slice = Slice;
+    to_companion.options = WMTBlitOptionNone;
+    to_companion.origin = {0, 0, 0};
+  }
+
   // in is not known, so a copy of one ends the pass. the hoisted pass is the current one until `Hoisted` ends
   struct Hoisted {
     MTLD3D12GraphicsCommandListImpl *list;
@@ -2137,6 +2263,28 @@ public:
     ~Hoisted() {
       if (render)
         list->allocator_->encoder_current = render;
+      // the copies this pass holds wrote BC4/BC5 blocks: the companions (made now if a view has not)
+      // decode the subresources the copies touched, between the copies and the render pass that reads them
+      for (auto &[copied, subresources] : list->bc_snorm_copied_) {
+        auto resource = static_cast<MTLD3D12Resource *>(copied);
+        if (!resource->texture || !BcSnormCompanionOf(resource))
+          continue;
+        auto *companion = resource->texture->bc_snorm.ptr();
+        for (UINT subresource : subresources) {
+          UINT mips = resource->texture->miplevelCount(), slices = resource->texture->arrayLength();
+          UINT first_level = 0, last_level = mips, first_slice = 0, last_slice = slices;
+          if (subresource != D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES) {
+            UINT level = 0, slice = 0, plane = 0;
+            DecomposeSubresource(resource->GetDesc(), subresource, &level, &slice, &plane);
+            first_level = last_level = level;
+            first_slice = last_slice = slice;
+          }
+          for (UINT slice = first_slice; slice < last_slice; slice++)
+            for (UINT level = first_level; level < last_level; level++)
+              list->RecordBcSnormCompanionDecode(resource->texture.ptr(), companion, level, slice);
+        }
+      }
+      list->bc_snorm_copied_.clear();
     }
   };
 
@@ -2397,6 +2545,7 @@ public:
                              ? (dst_planar ? WMTBlitOptionStencilFromDepthStencil : WMTBlitOptionDepthFromDepthStencil)
                              : WMTBlitOptionNone;
         cmd_cp.origin = {DstX, DstY, DstZ};
+        MarkBcSnormCopied(pDst->pResource, pDst->SubresourceIndex);
       } else {
         auto resource = static_cast<MTLD3D12Resource *>(pSrc->pResource);
         if (!resource->texture)
@@ -2464,6 +2613,7 @@ public:
             {src_box.right - src_box.left, src_box.bottom - src_box.top, src_box.back - src_box.front}, dst,
             dst_format, dst_level, dst_slice, {DstX, DstY, DstZ}, dst_extent
         );
+        MarkBcSnormCopied(pDst->pResource, pDst->SubresourceIndex);
       }
     } else if (pDst->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
       auto &dst = static_cast<MTLD3D12Resource *>(pDst->pResource)->buffer;
@@ -2489,14 +2639,24 @@ public:
         }
         auto src_planar_count = src_format.PlanarCount;
 
-        auto block_width = dst_format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+        // the footprint's format speaks in its raw identity: a BC4/BC5 SNORM footprint's Metal mapping is
+        // the decoded float storage, whose bytes-per-texel and lack of a BC bit would put a block-addressed
+        // offset's bytes in the wrong places (D3D12 addresses a block-compressed footprint's X and Y in blocks)
+        bool footprint_raw_bc = (dst_format.Flag & MTL_DXGI_FORMAT_BC) != 0 ||
+                                (pDst->PlacedFootprint.Footprint.Format >= DXGI_FORMAT_BC4_TYPELESS &&
+                                 pDst->PlacedFootprint.Footprint.Format <= DXGI_FORMAT_BC5_SNORM);
+        uint32_t footprint_block_width = footprint_raw_bc ? 4 : 1,
+                 footprint_bytes = footprint_raw_bc ? (dst_format.PixelFormat == WMTPixelFormatRG32Float ? 16 : 8)
+                                                    : dst_format.BytesPerTexel;
         auto dst_depth_pitch = src->textureType() == WMTTextureType3D
-                                   ? (pDst->PlacedFootprint.Footprint.Height / block_width) * pDst->PlacedFootprint.Footprint.RowPitch
+                                   ? (pDst->PlacedFootprint.Footprint.Height / footprint_block_width) *
+                                         pDst->PlacedFootprint.Footprint.RowPitch
                                    : 0;
 
         auto download = dst->current()->buffer();
-        const uint64_t dst_offset = pDst->PlacedFootprint.Offset + (DstX / block_width) * dst_format.BytesPerTexel +
-                                    (DstY / block_width) * pDst->PlacedFootprint.Footprint.RowPitch +
+        const uint64_t dst_offset = pDst->PlacedFootprint.Offset +
+                                    (DstX / footprint_block_width) * footprint_bytes +
+                                    (DstY / footprint_block_width) * pDst->PlacedFootprint.Footprint.RowPitch +
                                     DstZ * dst_depth_pitch;
         uint64_t download_offset = dst_offset, row_pitch = pDst->PlacedFootprint.Footprint.RowPitch,
                  image_pitch = dst_depth_pitch;
@@ -2599,10 +2759,12 @@ public:
       return;
     }
 
+    MarkBcSnormCopied(pDstResource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
     auto &cmd_cp = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_texture>();
     cmd_cp.type = WMTBlitCommandCopyTexture;
     cmd_cp.src = pSrc->texture->current()->texture();
     cmd_cp.dst = pDst->texture->current()->texture();
+    MarkBcSnormCopied(pDstResource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
   };
 
   void STDMETHODCALLTYPE CopyTiles(
@@ -4110,7 +4272,9 @@ public:
       std::fill_n(static_cast<SM50_STREAM_OUTPUT_TARGETS *>(Targets), MaxCommandCount, targets);
       cmd->so_targets = allocator_->gpu_heap_buffer_address_ + TargetsOffset;
       cmd->so_scratch_size = allocator_->so_scratch_size_;
-      cmd->so_invocations = cmd->geometry_threads * pso_graphics_->gs_instances;
+      cmd->so_invocations =
+          cmd->threads_per_patch ? pso_graphics_->so_counts : cmd->geometry_threads * pso_graphics_->gs_instances;
+      cmd->so_zeroed = cmd->threads_per_patch ? pso_graphics_->so_workloads : 0;
     }
     // a GPU without mesh commands in indirect command buffers: every command is a draw of its own, which binds what
     // the command's stages read and has the threadgroups the resolver left for it (none past the count)

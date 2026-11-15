@@ -127,6 +127,7 @@ struct mullion_render_command_data {
   device uint *so_targets;
   ulong so_scratch_size;
   uint so_invocations;
+  uint so_zeroed;
   device uint *so_lacked;
   uint statistics_first, statistics_step, statistics_cut, statistics_cuts;
   packed_uint2 execution_range;
@@ -346,14 +347,16 @@ public:
       source << "}\n";
       // stream output's grid, when the command's scratch (SM50StreamOutputScratch) fits, and the words of it its
       // passes add to (SM50StreamOutputZeroed): the filled sizes, then per stream a word for each object threadgroup
-      // and each block of them. a command whose scratch does not fit is left out, with what it needed
+      // and each block of them, and a tessellated command's first counts of each object threadgroup
+      // (tessellation_stream_output_zeroed). a command whose scratch does not fit is left out, with what it needed
       constexpr uint32_t block = 1u << SM50_STREAM_OUTPUT_BLOCK_SHIFT;
       uint64_t start = SM50StreamOutputZeroed(0), per_total = (SM50StreamOutputZeroed(block) - start) / (block + 1),
                per_count = SM50StreamOutputScratch(1, 1) - SM50StreamOutputScratch(1, 0);
       source << "if (command_data.so_targets) {\n";
       source << "ulong groups = ulong(draw.threadgroups.x) * draw.threadgroups.y;\n";
       source << "ulong zeroed = groups ? " << start << " + " << per_total << " * (groups + ((groups + " << block - 1
-             << ") >> " << SM50_STREAM_OUTPUT_BLOCK_SHIFT << ")) : 0;\n";
+             << ") >> " << SM50_STREAM_OUTPUT_BLOCK_SHIFT << ")) + " << per_count
+             << " * groups * command_data.so_zeroed : 0;\n";
       source << "ulong need = zeroed + " << per_count << " * groups * command_data.so_invocations;\n";
       source << "if (need > command_data.so_scratch_size) {\n";
       source << "command_data.so_lacked[i] = uint(min(need, ulong(UINT_MAX)));\n";

@@ -487,6 +487,7 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                       "is_parallel": True}]
             args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1)
             run.KNOWN = root / "known.txt"
+            run.KNOWN.write_text("")
             with patch.dict(os.environ, MULLION_TEST_LOCK=str(root / "gpu.lock")), redirect_stdout(StringIO()) as out:
                 failed = run.own(args, tests, [root], None, dict(os.environ))
             self.assertEqual(failed, 0, out.getvalue())
@@ -508,6 +509,7 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                       "is_parallel": name != "serial"} for name in ["a", "b", "flaky", "serial"]]
             args = Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=len(tests))
             run.KNOWN = root / "known.txt"
+            run.KNOWN.write_text("")
             # each measured, as one never measured runs alone
             run.PEAKS.write_text(json.dumps({run.measured(t["cmd"], dict(os.environ, **t["env"])): 0 for t in tests}))
             with redirect_stdout(StringIO()) as out:
@@ -538,6 +540,7 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             (root / "a.txt").write_text("wrong: a\n")
             three, two, one = (run.signature(f"failed: {n} wrong results", root / "a.txt") for n in (3, 2, 1))
             run.KNOWN = root / "known.txt"
+            run.KNOWN.write_text("")
             run.KNOWN.write_text(f"# a comment\nnative({chip}) same {three} -- the cause\n"
                                  f"native({chip}) other {two} -- the cause\n"
                                  f"native({chip}) fixed {one} -- the cause\n"
@@ -554,16 +557,23 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                                                out.getvalue(), re.M)), ["fixed", "fresh", "other", "skip"], out.getvalue())
             self.assertEqual(counted, 4)
             self.assertIn(f"new: native({chip}) other {three} (known: {two})", lines)
-            self.assertIn("1 known, each with its cause in " + str(run.KNOWN), lines)
-            for line in [f"9 same {three}", "9 fresh failed: hr (line 280) -- the cause", "9 same failed: 3 wrong results -- the cause"]:
+            self.assertIn("baseline: 1 unchanged non-passes with their cause in " + str(run.KNOWN), out.getvalue())
+            # a line with no cause is a mistake; a verdict with a cause is a known result, whatever it says (a
+            # failure the runner can print is listable by exactly what it printed)
+            run.KNOWN.write_text(f"9 same {three}\n")
+            with self.assertRaises(SystemExit):
+                run.known()
+            for line in ["9 fresh failed: hr (line 280) -- the cause", "9 same failed: 3 wrong results -- the cause"]:
                 run.KNOWN.write_text(line + "\n")
-                with self.assertRaises(SystemExit, msg=line):
-                    run.known()
+                self.assertTrue(run.known())
             run.KNOWN.write_text("9 skip skipped: no 16x -- the cause\n")
-            self.assertEqual(run.known(), {("9", "skip"): "skipped: no 16x"})
+            self.assertEqual(run.known(), {("9", "skip", None): "skipped: no 16x"})
             # a chip's name may have brackets of its own, as a virtual machine's has
             run.KNOWN.write_text("native(Apple M1 (Virtual)) skip skipped: no 16x -- the cause\n")
-            self.assertEqual(run.known(), {("native(Apple M1 (Virtual))", "skip"): "skipped: no 16x"})
+            self.assertEqual(run.known(), {("native(Apple M1 (Virtual))", "skip", None): "skipped: no 16x"})
+            # an arch-specific line keys on the machine, so two lines for one test do not overwrite each other
+            run.KNOWN.write_text("native(Apple M4 Pro)/x86_64 t failed: 1 wrong results [aaaaaaaa] -- the cause\n")
+            self.assertEqual(run.known(), {("native(Apple M4 Pro)", "t", "x86_64"): "failed: 1 wrong results [aaaaaaaa]"})
             # a list to compare with that is not there is a mistake, not an empty list
             with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
                 run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, known=root / "none.txt"),
@@ -575,7 +585,7 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
                 counted = run.own(Namespace(late=None, family="native", benchmark=False, repeat=1, jobs=1, validate=True),
                                   [test for test in tests if test["name"] == "skip"], [root], None, dict(os.environ))
             self.assertEqual(counted, 0, out.getvalue())
-            self.assertIn("1 known, each with its cause in " + str(run.KNOWN_VALIDATED), out.getvalue().splitlines())
+            self.assertIn("baseline: 1 unchanged non-passes with their cause in " + str(run.KNOWN_VALIDATED), out.getvalue())
 
     def test_runner_answers(self):
         # one count of wrong results is two failures when the results differ, and a test that answers differently on
@@ -589,6 +599,7 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             (root / "hung.txt").write_text("step: 2\n")
             self.assertEqual(run.signature("still running after 31 s: step: 2", root / "hung.txt"), "still running")
             run.KNOWN = root / "known.txt"
+            run.KNOWN.write_text("")
             known = run.signature("failed: 1 wrong results", root / "a.txt")
             run.KNOWN.write_text("".join(f"native({chip}) {name} {known} -- the cause\n" for name in ["same", "twin"]))
             script = ("import sys; name, at = sys.argv[1], sys.argv[2]; open(at, 'a').write('x'); runs = len(open(at).read())\n"
@@ -609,8 +620,8 @@ void i() { if (use([](int x) { return x + 1; })) { restore(); } }
             with self.assertRaises(SystemExit):
                 run.known(args.record)
             args.record.write_text("".join(line + "\n" for line in recorded if " flip " not in line))
-            self.assertEqual(run.known(args.record)[f"native({chip})", "same"], known)
-            self.assertEqual(set(run.known(args.record)), {(f"native({chip})", "same"), (f"native({chip})", "twin")})
+            self.assertEqual(run.known(args.record)[f"native({chip})", "same", None], known)
+            self.assertEqual(set(run.known(args.record)), {(f"native({chip})", "same", None), (f"native({chip})", "twin", None)})
             self.assertEqual(counted, 2)
             self.assertRegex(out.getvalue(), r"failed +flip .*unstable: ")
             self.assertEqual([len((root / name).read_text()) for name in ["same", "twin", "flip"]], [2, 2, 2])

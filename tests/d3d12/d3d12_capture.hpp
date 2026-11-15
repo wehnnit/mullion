@@ -69,7 +69,9 @@ on_destruction(IUnknown *object, HANDLE gone) {
   ID3DDestructionNotifier *notifier;
   if (FAILED(object->QueryInterface(IID_PPV_ARGS(&notifier))))
     return false;
-  HRESULT hr = notifier->RegisterDestructionCallback([](void *gone) { SetEvent(gone); }, gone, nullptr);
+  // WINAPI, not the default: on i386 PFN_DESTRUCTION_CALLBACK is __stdcall, and a captureless lambda only converts
+  // to a function pointer of the calling convention it declares
+  HRESULT hr = notifier->RegisterDestructionCallback([](void *gone) WINAPI { SetEvent(gone); }, gone, nullptr);
   notifier->Release();
   return SUCCEEDED(hr);
 }

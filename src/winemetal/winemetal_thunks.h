@@ -313,6 +313,19 @@ struct unixcall_mtlcommandbuffer_denoised_scale {
   bool metal4;
 };
 
+struct unixcall_mtldevice_newframeinterpolator {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+  bool metal4;
+};
+
+struct unixcall_mtlcommandbuffer_interpolate_frame {
+  obj_handle_t cmdbuf;
+  obj_handle_t interpolator;
+  struct WMTConstMemoryPointer args;
+};
+
 struct unixcall_nsstring_string {
   struct WMTConstMemoryPointer buffer_ptr;
   enum WMTStringEncoding encoding;
@@ -326,6 +339,11 @@ struct unixcall_create_metal_view_from_hwnd {
   obj_handle_t ret_view;
   obj_handle_t ret_layer;
 };
+STATIC_ASSERT(sizeof(struct unixcall_create_metal_view_from_hwnd) == 72);
+STATIC_ASSERT(offsetof(struct unixcall_create_metal_view_from_hwnd, hwnd) == 0);
+STATIC_ASSERT(offsetof(struct unixcall_create_metal_view_from_hwnd, placement) == 8);
+STATIC_ASSERT(offsetof(struct unixcall_create_metal_view_from_hwnd, ret_view) == 56);
+STATIC_ASSERT(offsetof(struct unixcall_create_metal_view_from_hwnd, ret_layer) == 64);
 
 struct unixcall_metal_view_set_placement {
   obj_handle_t view;

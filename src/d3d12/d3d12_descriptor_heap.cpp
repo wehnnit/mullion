@@ -181,7 +181,8 @@ public:
 
       Flags<BufferAllocationFlag> flags;
 #ifdef __i386__
-      IMPLEMENT_ME
+      /* the CPU writes the descriptors into the mapping, which Metal must not put past 4 GB */
+      flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
       buffer_->rename(buffer_->allocate(flags));
       mapped_argument_buffer_ =
@@ -198,6 +199,10 @@ public:
   };
 
   ~MTLD3D12DescriptorHeapImpl() {
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+    heap_table_remove(this);
+#endif
+    // the constructor reserved the CPU storage with VirtualAlloc, so it is released here and not with free()
     if (!descriptors_.empty())
       VirtualFree(descriptors_.data(), 0, MEM_RELEASE);
     if (buffer_) {
@@ -515,6 +520,12 @@ public:
   MTLD3D12RenderTargetDescriptorHeapImpl(MTLD3D12Device *pDevice) :
       MTLD3D12Pageable<MTLD3D12RenderTargetDescriptorHeap>(pDevice) {}
 
+  ~MTLD3D12RenderTargetDescriptorHeapImpl() {
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+    heap_table_remove(this);
+#endif
+  }
+
   HRESULT
   Initialize(const D3D12_DESCRIPTOR_HEAP_DESC *pDesc) {
     if (!pDesc)
@@ -651,7 +662,7 @@ public:
 
       Flags<BufferAllocationFlag> flags;
 #ifdef __i386__
-      IMPLEMENT_ME
+      flags.set(BufferAllocationFlag::CpuPlaced);
 #endif
       buffer_->rename(buffer_->allocate(flags));
       mapped_argument_buffer_ = reinterpret_cast<SamplerGPUStorage *>(buffer_->current()->mappedMemory(0));
@@ -668,6 +679,9 @@ public:
   };
 
   ~MTLD3D12SamplerDescriptorHeapImpl() {
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+    heap_table_remove(this);
+#endif
      if (buffer_) {
       device_->UnregisterResidencyAndVA(buffer_->current());
     } else {
@@ -773,6 +787,13 @@ CreateDescriptorHeap(
   InitReturnPtr(ppDescriptorHeap);
   if (!pDesc)
     return FAIL(E_INVALIDARG);
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+  /* a 32-bit handle names the heap through the table; creation refuses when the table is full. */
+  if (!heap_table_has_room()) {
+    ERR("CreateDescriptorHeap: the 32-bit handle table has no slot left for another heap");
+    return E_OUTOFMEMORY;
+  }
+#endif
   if (pDesc->NumDescriptors >> EMBEDDED_DESCRIPTOR_HANDLE::kDescriptorBits) {
     ERR("CreateDescriptorHeap: ", pDesc->NumDescriptors, " descriptors of type ", pDesc->Type, " are too many");
     return E_INVALIDARG;

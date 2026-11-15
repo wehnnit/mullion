@@ -4,10 +4,19 @@
 #include "d3d12.h"
 
 extern "C" HRESULT WINAPI D3D12GetInterface(REFCLSID clsid, REFIID iid, void **object);
+extern "C" HRESULT WINAPI D3D12CoreRegisterLayers(const void *layers, UINT count);
+extern "C" SIZE_T WINAPI D3D12CoreGetLayeredDeviceSize(const void *layers, UINT count);
+extern "C" HRESULT WINAPI
+D3D12CoreCreateLayeredDevice(const void *layers, UINT count, const void *args, REFIID iid, void **device);
+extern "C" UINT WINAPI GetBehaviorValue(const WCHAR *name, UINT default_value);
 
 // each export is code of its own (loader_ here, named in d3d12.def) that calls the core's: Windows' loader exports
 // functions, not forwarders, and an application that reads an export's address from the table itself (God of War
 // Ragnarok) runs what it finds there
+extern "C" UINT WINAPI loader_GetBehaviorValue(const WCHAR *name, UINT default_value) {
+  return GetBehaviorValue(name, default_value);
+}
+
 extern "C" HRESULT WINAPI
 loader_D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL level, REFIID iid, void **device) {
   return D3D12CreateDevice(adapter, level, iid, device);
@@ -48,4 +57,19 @@ loader_D3D12GetInterface(REFCLSID clsid, REFIID iid, void **object) {
 extern "C" HRESULT WINAPI
 loader_D3D12EnableExperimentalFeatures(UINT count, const IID *iids, void *configurations, UINT *sizes) {
   return D3D12EnableExperimentalFeatures(count, iids, configurations, sizes);
+}
+
+extern "C" HRESULT WINAPI
+loader_D3D12CoreRegisterLayers(const void *layers, UINT count) {
+  return D3D12CoreRegisterLayers(layers, count);
+}
+
+extern "C" SIZE_T WINAPI
+loader_D3D12CoreGetLayeredDeviceSize(const void *layers, UINT count) {
+  return D3D12CoreGetLayeredDeviceSize(layers, count);
+}
+
+extern "C" HRESULT WINAPI
+loader_D3D12CoreCreateLayeredDevice(const void *layers, UINT count, const void *args, REFIID iid, void **device) {
+  return D3D12CoreCreateLayeredDevice(layers, count, args, iid, device);
 }

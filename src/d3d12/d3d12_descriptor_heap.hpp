@@ -20,20 +20,51 @@
 #include "d3d12.h"
 #include "mullion_buffer.hpp"
 #include "mullion_texture.hpp"
+#include <atomic>
 #include <bit>
 #include <cstdint>
+#include <mutex>
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
 #define MULLION_USE_EMBEDDED_HEAP_POINTER
+#endif
+
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+/* the table of the live descriptor heaps the 32-bit handles name; declared here, defined below. */
+namespace mullion {
+uint32_t heap_table_install(const void *heap);
+void *heap_table_load(uint32_t slot);
+bool heap_table_has_room();
+void heap_table_remove(const void *heap);
+}
 #endif
 
 namespace mullion {
 
 struct EMBEDDED_DESCRIPTOR_HANDLE {
 #ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
-  SIZE_T Tag        : 5;
-  SIZE_T Descriptor : 20;
-  SIZE_T Heap       : 7;
+  // a 32-bit handle cannot carry the heap's address, so it carries the heap's slot in a process-wide
+  // table of the live heaps. Handles are process-scoped, like the 64-bit handles' addresses are.
+  // the descriptor field counts 32-byte steps, the storage entry's size, so a 32-bit handle reaches
+  // 1,048,575 descriptors of a shader-visible heap: D3D12's own tier-one limit. Creation refuses more.
+  static constexpr unsigned kIncrementBits = 5, kHeapBits = 7,
+                            kMaxHeaps = 1u << kHeapBits,
+                            kDescriptorBits = sizeof(SIZE_T) * 8 - kIncrementBits - kHeapBits;
+  SIZE_T Tag        : kIncrementBits;
+  SIZE_T Descriptor : kDescriptorBits;
+  SIZE_T Heap       : kHeapBits;
+
+  template <typename T>
+  T *
+  extract() {
+    return static_cast<T *>(heap_table_load(Heap));
+  }
+
+  EMBEDDED_DESCRIPTOR_HANDLE(const void *heap, SIZE_T index) {
+    Tag = 0;
+    Heap = heap_table_install(heap);
+    Descriptor = index;
+  }
 #else
   // a heap is aligned to a page and a user address has 47 bits, which leaves the heap's bits; consecutive
   // descriptors' handles differ in the bits above the low ones, and the descriptor's index has the rest
@@ -79,6 +110,78 @@ struct EMBEDDED_DESCRIPTOR_HANDLE {
 };
 
 static_assert(sizeof(EMBEDDED_DESCRIPTOR_HANDLE) == sizeof(D3D12_CPU_DESCRIPTOR_HANDLE));
+
+#ifndef MULLION_USE_EMBEDDED_HEAP_POINTER
+/* the table of the live descriptor heaps the 32-bit handles name. Installation is idempotent, so a
+ * heap installed again, as every descriptor write does, keeps its slot. Reads stay lock-free; a
+ * handle read after its heap's destruction is as undefined as reading a freed heap's address is on
+ * 64 bits. */
+struct DescriptorHeapTable {
+  std::mutex mutex;
+  std::atomic<void *> slots[EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps];
+
+  uint32_t
+  install(const void *heap) {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (unsigned i = 0; i < EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps; i++) {
+      if (slots[i].load(std::memory_order_acquire) == heap)
+        return i;
+    }
+    for (unsigned i = 0; i < EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps; i++) {
+      if (!slots[i].load(std::memory_order_acquire)) {
+        slots[i].store(const_cast<void *>(heap), std::memory_order_release);
+        return i;
+      }
+    }
+    return EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps;
+  }
+
+  bool
+  has_room() {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (unsigned i = 0; i < EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps; i++) {
+      if (!slots[i].load(std::memory_order_acquire))
+        return true;
+    }
+    return false;
+  }
+
+  void
+  remove(const void *heap) {
+    std::lock_guard<std::mutex> lock(mutex);
+    for (unsigned i = 0; i < EMBEDDED_DESCRIPTOR_HANDLE::kMaxHeaps; i++) {
+      if (slots[i].load(std::memory_order_acquire) == heap)
+        slots[i].store(nullptr, std::memory_order_release);
+    }
+  }
+};
+
+inline DescriptorHeapTable &
+heap_table() {
+  static DescriptorHeapTable table;
+  return table;
+}
+
+inline uint32_t
+heap_table_install(const void *heap) {
+  return heap_table().install(heap);
+}
+
+inline void *
+heap_table_load(uint32_t slot) {
+  return heap_table().slots[slot].load(std::memory_order_acquire);
+}
+
+inline bool
+heap_table_has_room() {
+  return heap_table().has_room();
+}
+
+inline void
+heap_table_remove(const void *heap) {
+  heap_table().remove(heap);
+}
+#endif
 
 enum class ShaderVisibleDescriptorType {
   Null,

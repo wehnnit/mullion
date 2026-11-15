@@ -388,6 +388,7 @@ read_control_flow(
           .arg_index = 0,
           .arg_cube_index = 0,
           .arg_metadata_index = 0,
+          .arg_border_index = 0,
       };
       // FIXME: SamplerMode ignored?
       break;

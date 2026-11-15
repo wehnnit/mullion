@@ -34,7 +34,9 @@ public:
         depth_stencil_format(pDesc->DepthStencilFormat), device_(pDevice),
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
-        SampleCount(pDesc->SampleCount) {
+        SampleCount(pDesc->SampleCount),
+        diamond_lines_(pDesc->DiamondLines),
+        depth_max_(pDesc->DepthMax) {
     if (pDesc->RasterizationEnabled && !pDesc->PixelShader)
       num_rtvs = 0;
     uint32_t unorm_output_reg_mask = 0;
@@ -60,7 +62,9 @@ public:
         break;
       // the counting pass draws nothing
       ShaderVariantStreamOutput so{
-          pDesc->SOLayout, counting, pDesc->InputPrimitive, pDesc->PassThrough && !counting, pDesc->QuadLines && !counting
+          pDesc->SOLayout, counting, pDesc->InputPrimitive, pDesc->PassThrough && !counting,
+          pDesc->QuadLines && !counting, pDesc->DiamondLines && !counting, pDesc->DepthMax && !counting,
+          pDesc->PlaneSlope && !counting
       };
       VertexShader[counting] = pDesc->VertexShader->get_shader(ShaderVariantGeometryVertex{
           pDesc->InputLayout, pDesc->GeometryShader, pDesc->IndexBufferFormat, pDesc->GSStripTopology, so});
@@ -74,7 +78,8 @@ public:
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
           unorm_output_reg_mask, pDesc->PipelineStatistics, pDesc->BlendState->IsAlphaToCoverage(),
-          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->PairedSamples, pDesc->ClipDistances},
+          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->PairedSamples, pDesc->ClipDistances,
+          pDesc->DepthUnormBits, pDesc->DiamondLines, pDesc->PlaneSlope},
           {rtv_formats, num_rtvs}, pDesc->BlendState);
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
@@ -139,6 +144,9 @@ public:
 
     if (PixelShader && RasterizationEnabled) {
       info.fragment_function = ps.Function;
+    } else if (depth_stencil_format != WMTPixelFormatInvalid && RasterizationEnabled) {
+      // aliased lines are expanded in this mesh stage, so the diamond test has to live on this pipeline
+      info.fragment_function = DepthCorrectFunction(device_->GetMTLDevice(), diamond_lines_, depth_max_);
     }
     info.rasterization_enabled = RasterizationEnabled;
 
@@ -202,6 +210,8 @@ private:
   WMT::Reference<WMT::RenderPipelineState> state_mesh_[2];
   bool RasterizationEnabled;
   UINT SampleCount;
+  bool diamond_lines_;
+  bool depth_max_;
   uint32_t GeometryInstances;
   uint32_t MeshInstances;
 

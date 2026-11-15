@@ -576,6 +576,167 @@ conservative_overlap(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, llv
   return {outside, inside};
 }
 
+// no depth target: the slope bias is added to the z the pixel shader reports. aliased lines: the mesh draws a quad around
+// the line and this keeps the pixels the diamond-exit rule covers, with the line's own z and w (D3D11.3 3.4.4, 15.10)
+static void
+append_pixel_position_fix(
+    air::FunctionSignatureBuilder &func_signature, IREffect &prologue, int position_reg, uint32_t position_arg,
+    bool slope, bool diamond, bool plane
+) {
+  if (position_reg < 0 || (!slope && !diamond))
+    return;
+  uint32_t bias_arg = ~0u, line_a = ~0u, line_b = ~0u, plane_arg = ~0u;
+  if (slope)
+    bias_arg = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .location_index = SM50_BINDING_INDEX_DEPTH_BIAS,
+        .array_size = 8,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::msl_float,
+        .arg_name = "depth_bias",
+    });
+  if (diamond) {
+    line_a = func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "mullion_line_a", .type = air::msl_float4, .interpolation = air::Interpolation::flat, .pull_mode = false
+    });
+    line_b = func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "mullion_line_b", .type = air::msl_float4, .interpolation = air::Interpolation::flat, .pull_mode = false
+    });
+  }
+  if (plane)
+    plane_arg = func_signature.DefineInput(air::InputFragmentStageIn{
+        .user = "mullion_plane_slope", .type = air::msl_float2, .interpolation = air::Interpolation::flat, .pull_mode = false
+    });
+  prologue << make_effect([=](struct context ctx) {
+    auto &builder = ctx.builder;
+    auto &air = ctx.air;
+    llvm::FastMathFlags precise;
+    llvm::IRBuilder<>::FastMathFlagGuard guard(builder);
+    builder.setFastMathFlags(precise);
+    auto zero = air.getFloat(0);
+    auto one = air.getFloat(1);
+    auto half = air.getFloat(0.5f);
+    auto at = [&](llvm::Value *v, uint64_t i) { return builder.CreateExtractElement(v, i); };
+    auto position = ctx.function->getArg(position_arg);
+    auto array_ty = llvm::ArrayType::get(ctx.types._float4, ctx.resource.input_element_count);
+    auto component = [&](unsigned c) {
+      return builder.CreateInBoundsGEP(
+          array_ty, ctx.resource.input.ptr_float4,
+          {builder.getInt32(0), builder.getInt32((unsigned)position_reg), builder.getInt32(c)}
+      );
+    };
+    if (slope) {
+      auto words = ctx.function->getArg(bias_arg);
+      auto load = [&](unsigned i) {
+        return builder.CreateLoad(ctx.types._float, builder.CreateConstInBoundsGEP1_32(ctx.types._float, words, i));
+      };
+      auto scale = load(1), clampv = load(2), apply = load(4);
+      auto z = at(position, 2);
+      // wireframe rasterizes the edges, whose derivatives are not the triangle's (D3D11.3 15.10). the mesh wrote the plane
+      llvm::Value *slope_z;
+      if (plane) {
+        auto gradient = ctx.function->getArg(plane_arg);
+        slope_z = builder.CreateBinaryIntrinsic(
+            llvm::Intrinsic::maxnum, air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, at(gradient, 0), false),
+            air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, at(gradient, 1), false)
+        );
+      } else {
+        slope_z = builder.CreateBinaryIntrinsic(
+            llvm::Intrinsic::maxnum, air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, air.CreateDerivative(z, false), false),
+            air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, air.CreateDerivative(z, true), false)
+        );
+      }
+      // a NaN scale stays NaN: unordered, where an ordered compare would call it equal to zero
+      auto scaled = builder.CreateSelect(builder.CreateFCmpUNE(scale, zero), builder.CreateFMul(scale, slope_z), scale);
+      auto value = builder.CreateSelect(
+          builder.CreateFCmpOGT(clampv, zero),
+          builder.CreateSelect(builder.CreateFCmpOLT(scaled, clampv), scaled, clampv), scaled
+      );
+      value = builder.CreateSelect(
+          builder.CreateFCmpOLT(clampv, zero),
+          builder.CreateSelect(builder.CreateFCmpOGT(value, clampv), value, clampv), value
+      );
+      auto use = builder.CreateAnd(
+          builder.CreateFCmpUNE(apply, zero),
+          builder.CreateOr(builder.CreateFCmpUNE(scale, zero), builder.CreateFCmpUNE(clampv, zero))
+      );
+      builder.CreateStore(builder.CreateSelect(use, builder.CreateFAdd(builder.CreateLoad(ctx.types._float, component(2)), value),
+                                               builder.CreateLoad(ctx.types._float, component(2))),
+                          component(2));
+    }
+    if (diamond) {
+      auto a = ctx.function->getArg(line_a), b = ctx.function->getArg(line_b);
+      auto px = at(position, 0), py = at(position, 1);
+      auto ax = at(a, 0), ay = at(a, 1), bx = at(b, 0), by = at(b, 1);
+      llvm::Value *lo = zero, *hi = one, *miss = builder.getFalse();
+      for (int sx : {-1, 1})
+        for (int sy : {-1, 1}) {
+          auto sxf = air.getFloat(float(sx)), syf = air.getFloat(float(sy));
+          auto d = builder.CreateFSub(
+              builder.CreateFAdd(builder.CreateFMul(sxf, builder.CreateFSub(ax, px)),
+                                 builder.CreateFMul(syf, builder.CreateFSub(ay, py))),
+              half
+          );
+          auto sl = builder.CreateFAdd(builder.CreateFMul(sxf, builder.CreateFSub(bx, ax)),
+                                       builder.CreateFMul(syf, builder.CreateFSub(by, ay)));
+          auto zero_slope = builder.CreateFCmpOEQ(sl, zero);
+          auto kill = builder.CreateOr(builder.CreateFCmpOGT(d, zero),
+                                       builder.CreateAnd(builder.CreateFCmpOEQ(d, zero), builder.getInt1(sy < 0)));
+          miss = builder.CreateOr(miss, builder.CreateAnd(zero_slope, kill));
+          auto bound = builder.CreateFDiv(builder.CreateFNeg(d), sl);
+          lo = builder.CreateSelect(builder.CreateFCmpOLT(sl, zero),
+                                    builder.CreateSelect(builder.CreateFCmpOGT(bound, lo), bound, lo), lo);
+          hi = builder.CreateSelect(builder.CreateFCmpOGT(sl, zero),
+                                    builder.CreateSelect(builder.CreateFCmpOLT(bound, hi), bound, hi), hi);
+        }
+      auto dx = builder.CreateFSub(bx, ax), dy = builder.CreateFSub(by, ay);
+      auto ymajor = builder.CreateFCmpOGT(air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, dy, false),
+                                          air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, dx, false));
+      auto inside = [&](llvm::Value *t) {
+        auto u = builder.CreateFSub(builder.CreateFAdd(ax, builder.CreateFMul(t, dx)), px);
+        auto v = builder.CreateFSub(builder.CreateFAdd(ay, builder.CreateFMul(t, dy)), py);
+        auto manh = builder.CreateFAdd(air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, u, false),
+                                       air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, v, false));
+        auto edge = builder.CreateOr(builder.CreateFCmpOGT(v, zero),
+                                     builder.CreateAnd(builder.CreateFCmpOEQ(u, half), ymajor));
+        return builder.CreateOr(builder.CreateFCmpOLT(manh, half),
+                                builder.CreateAnd(builder.CreateFCmpOEQ(manh, half), edge));
+      };
+      auto tmid = builder.CreateFMul(builder.CreateFAdd(lo, hi), half);
+      auto hit = builder.CreateAnd(
+          builder.CreateNot(miss),
+          builder.CreateAnd(
+              builder.CreateFCmpOLE(lo, hi),
+              builder.CreateAnd(builder.CreateFCmpOGE(hi, zero),
+                                builder.CreateAnd(builder.CreateOr(builder.CreateFCmpOLT(hi, one),
+                                                                   builder.CreateNot(inside(one))),
+                                                  inside(tmid)))
+          )
+      );
+      auto degenerate = builder.CreateAnd(builder.CreateFCmpOEQ(dx, zero), builder.CreateFCmpOEQ(dy, zero));
+      hit = builder.CreateAnd(hit, builder.CreateNot(degenerate));
+      auto t = builder.CreateFDiv(
+          builder.CreateFAdd(builder.CreateFMul(builder.CreateFSub(px, ax), dx), builder.CreateFMul(builder.CreateFSub(py, ay), dy)),
+          builder.CreateFAdd(builder.CreateFMul(dx, dx), builder.CreateFMul(dy, dy))
+      );
+      auto lerp = [&](uint64_t c) {
+        return builder.CreateFAdd(at(a, c), builder.CreateFMul(t, builder.CreateFSub(at(b, c), at(a, c))));
+      };
+      // the register holds clip w, which is the reciprocal of the interpolated reciprocal (init_input_reg)
+      builder.CreateStore(lerp(2), component(2));
+      builder.CreateStore(builder.CreateFDiv(one, lerp(3)), component(3));
+      auto discarded = llvm::BasicBlock::Create(ctx.llvm, "diamond_discard", ctx.function);
+      auto kept = llvm::BasicBlock::Create(ctx.llvm, "diamond_kept", ctx.function);
+      builder.CreateCondBr(hit, kept, discarded);
+      builder.SetInsertPoint(discarded);
+      air.CreateDiscard();
+      builder.CreateBr(kept);
+      builder.SetInsertPoint(kept);
+    }
+    return std::monostate{};
+  });
+}
+
 llvm::Error convert_dxbc_pixel_shader(
   SM50ShaderInternal *pShaderInternal, const char *name,
   llvm::LLVMContext &context, llvm::Module &module,
@@ -639,13 +800,20 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
-    sig_ctx.barycentric_rows = pso_data && (pso_data->quad_lines || pso_data->conservative);
+    sig_ctx.barycentric_rows = pso_data && (pso_data->quad_lines || pso_data->diamond_lines || pso_data->conservative);
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
+    sig_ctx.depth_unorm_bits = pso_data ? pso_data->depth_unorm_bits : 0;
     if (pso_pixel_formats)
       memcpy(sig_ctx.pixel_formats, pso_pixel_formats, sizeof(sig_ctx.pixel_formats));
     for (auto &p : pShaderInternal->signature_handlers) {
       p(sig_ctx);
     }
+    if (pso_data && pso_data->diamond_lines)
+      shader_info->discards = true;
+    append_pixel_position_fix(
+        func_signature, prologue, sig_ctx.position_reg, sig_ctx.position_arg, pso_disable_depth_output,
+        pso_data && pso_data->diamond_lines, pso_data && pso_data->plane_slope
+    );
   }
   // an unwritten o1 leaves the second blend source undefined (Vulkan, Dual-Source Blending); Metal refuses the
   // pipeline without one, so it is zero, as the epilogue starts every output
@@ -738,6 +906,36 @@ llvm::Error convert_dxbc_pixel_shader(
         .user = cull_varying_name(i), .type = air::msl_float, .interpolation = air::Interpolation::center_no_perspective,
         .pull_mode = false
     }));
+  // D24 is stored as a float. an incoming depth that is not written is still rounded to 24-bit unorm before the test,
+  // which is what writing it does (D3D11.3 17.11). viewport 0: these draws use one viewport
+  if (pso_data && pso_data->depth_unorm_bits == 24 && !pso_disable_depth_output && !early_tests &&
+      !std::ranges::any_of(func_signature.Outputs(), [](auto &output) {
+        return std::holds_alternative<air::OutputDepth>(output);
+      })) {
+    auto position = func_signature.DefineInput(air::InputPosition{.interpolation = air::Interpolation::center_no_perspective});
+    auto ranges = func_signature.DefineInput(air::ArgumentBindingBuffer{
+        .location_index = SM50_BINDING_INDEX_DEPTH_RANGES,
+        .array_size = 1,
+        .memory_access = air::MemoryAccess::read,
+        .address_space = air::AddressSpace::constant,
+        .type = air::msl_float,
+        .arg_name = "depth_ranges",
+    });
+    auto at = func_signature.DefineOutput(air::OutputDepth{air::DepthArgument::any});
+    epilogue >> [=](pvalue value) {
+      return make_irvalue([=](struct context ctx) {
+        using llvm::air::AIRBuilder;
+        auto &ir = ctx.builder;
+        auto z = ir.CreateExtractElement(ctx.function->getArg(position), uint64_t(2));
+        auto range = [&](unsigned end) {
+          return ir.CreateLoad(ctx.types._float, ir.CreateConstInBoundsGEP1_32(ctx.types._float, ctx.function->getArg(ranges), end));
+        };
+        z = ctx.air.CreateFPBinOp(AIRBuilder::fmin, range(1), ctx.air.CreateFPBinOp(AIRBuilder::fmax, range(0), z, false), false);
+        z = quantize_d24(ir, z);
+        return ir.CreateInsertValue(value, z, {at});
+      });
+    };
+  }
   // and the depth a pipeline that clamps it would take, which a shader that may discard has to write itself: Metal
   // clamps what it interpolates past the depth range wrongly, and what it writes as it should (probe-depth-clamp.m),
   // unless the shader writes its own or its tests come first
@@ -1890,6 +2088,9 @@ static int SM50InitializeUncached(
     sampler.arg_metadata_index = binding_table.DefineInteger64(
       "meta_s" + std::to_string(range_id), attr_index + 2
     );
+    sampler.arg_border_index = binding_table.DefineInteger64(
+      "border_s" + std::to_string(range_id), attr_index + 3
+    );
     sm50_shader->args_reflection.push_back({
       .Type = SM50BindingType::Sampler,
       .SM50BindingSlot = range_id,
@@ -2467,6 +2668,9 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
   SM50_SHADER_PSO_TESSELLATOR_DATA *pso_tess = nullptr;
   mullion::dxbc::args_get_data<SM50_SHADER_PSO_TESSELLATOR, SM50_SHADER_PSO_TESSELLATOR_DATA>(pDomainShaderArgs, &pso_tess);
   auto pGeometryShader = pso_tess ? (dxbc::SM50ShaderInternal *)pso_tess->geometry : nullptr;
+  // so does it with stream output and no geometry shader, a primitive at a time
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
+  mullion::dxbc::args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pDomainShaderArgs, &so);
 
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
@@ -2475,10 +2679,14 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
                                        pGeometryShader, FunctionName, (dxbc::SM50ShaderInternal *)pDomainShader,
                                        context, *pModule, pDomainShaderArgs, (dxbc::SM50ShaderInternal *)pHullShader
                                    )
-                                 : mullion::dxbc::convert_dxbc_tesselator_domain_shader(
-                                       (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
-                                       (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule, pDomainShaderArgs
-                                   )) {
+                 : so ? mullion::dxbc::convert_tessellated_stream_output(
+                            (dxbc::SM50ShaderInternal *)pDomainShader, (dxbc::SM50ShaderInternal *)pHullShader,
+                            FunctionName, context, *pModule, pDomainShaderArgs
+                        )
+                      : mullion::dxbc::convert_dxbc_tesselator_domain_shader(
+                            (dxbc::SM50ShaderInternal *)pDomainShader, FunctionName,
+                            (dxbc::SM50ShaderInternal *)pHullShader, context, *pModule, pDomainShaderArgs
+                        )) {
     errorOut << llvm::toString(std::move(err));
     *ppError = (sm50_error_t)errorObj;
     return 1;

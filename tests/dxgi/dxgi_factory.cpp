@@ -177,19 +177,37 @@ main() {
         step("factory entry %u flags %#x tearing data size %u", entry, flags, size);
         data.fill(std::numeric_limits<BYTE>::max());
         hr = factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, data.data(), size);
-        expect(hr == (size == sizeof(BOOL) ? S_OK : E_INVALIDARG), "feature size: %#lx", hr);
-        expect(data.back() == std::numeric_limits<BYTE>::max(), "feature query wrote beyond BOOL");
+        // a wrong size is DXGI_ERROR_INVALID_CALL, not E_INVALIDARG: Wine asserts that for sizeof(data) - 1 and
+        // sizeof(data) + 1 (dlls/dxgi/tests/dxgi.c:7011-7015), and only the exact size reaches S_OK
+        expect(hr == (size == sizeof(BOOL) ? S_OK : DXGI_ERROR_INVALID_CALL), "feature size: %#lx", hr);
+        expect(data.back() == std::numeric_limits<BYTE>::max(), "feature size %u wrote beyond BOOL", size);
         if (size == sizeof(BOOL)) {
           BOOL supported;
           memcpy(&supported, data.data(), sizeof(supported));
           expect(supported == FALSE || supported == TRUE, "non-BOOL tearing capability");
         }
       }
+      // no data pointer at all. The reference does not settle what Windows returns here: Wine carries the case
+      // inside `if (0)`, commented "Crashes on Windows" (dlls/dxgi/tests/dxgi.c:7005-7009). So this asserts a
+      // deliberate divergence rather than a contract -- refusing and writing nothing, instead of faulting -- and
+      // says so, because docs/TESTING.md 5.2 takes expected values from the specification, and where the
+      // specification is silent there is nothing to take it from.
+      expect(
+          factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL))
+                  == DXGI_ERROR_INVALID_CALL,
+          "a NULL feature buffer was not refused"
+      );
       expect(
           factory->CheckFeatureSupport(
               DXGI_FEATURE(DXGI_FEATURE_PRESENT_ALLOW_TEARING + 1), data.data(), sizeof(BOOL)
-          ) == E_INVALIDARG,
+          ) == DXGI_ERROR_INVALID_CALL,
           "unknown feature"
+      );
+      // an unknown feature number is refused the same way whatever its size (dlls/dxgi/tests/dxgi.c:7001-7002)
+      expect(
+          factory->CheckFeatureSupport(DXGI_FEATURE(0x12345678), data.data(), sizeof(BOOL))
+                  == DXGI_ERROR_INVALID_CALL,
+          "an arbitrary unknown feature was not refused"
       );
       for (UINT flags = 0; flags <= DXGI_MWA_VALID; flags++) {
         step("factory entry %u association flags %#x", entry, flags);

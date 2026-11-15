@@ -209,6 +209,43 @@ JoinShare(const SharedTextureData &data, HANDLE carried = nullptr) {
 
 #pragma region DeviceTexture
 
+void
+RefreshBcSnormCompanion(Texture *texture, MTLD3D11Device *device) {
+  if (!texture)
+    return;
+  bool rg = texture->pixelFormat() == WMTPixelFormatBC5_RGUnorm;
+  if (!rg && texture->pixelFormat() != WMTPixelFormatBC4_RUnorm)
+    return;
+  if (!texture->bc_snorm) {
+    auto info = texture->info();
+    info.pixel_format = rg ? WMTPixelFormatRG32Float : WMTPixelFormatR32Float;
+    info.usage = WMTTextureUsage(info.usage | WMTTextureUsageShaderRead);
+    texture->bc_snorm = new Texture(info, device->GetMTLDevice());
+    Flags<TextureAllocationFlag> flags;
+    flags.set(TextureAllocationFlag::GpuPrivate);
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+    auto allocation = texture->bc_snorm->allocate(flags);
+    if (!allocation || !allocation->texture())
+      return;
+    texture->bc_snorm->rename(std::move(allocation));
+  }
+  auto &initializer = device->GetMullionDevice().queue().initializer;
+  for (uint32_t level = 0; level < texture->miplevelCount(); level++) {
+    uint32_t width = std::max(1u, texture->width() >> level);
+    if (level < texture->bc_mips.size() && !texture->bc_mips[level].empty()) {
+      size_t blocks_x = (width + 3) / 4;
+      initializer.initWithData(
+          texture->bc_snorm.ptr(), texture->bc_snorm->current(), 0, level, texture->bc_mips[level].data(),
+          blocks_x * (rg ? 16 : 8), 0, MTL_DXGI_FORMAT_BC_SNORM_DECODED
+      );
+    } else {
+      initializer.initWithZero(texture->bc_snorm.ptr(), texture->bc_snorm->current(), 0, level);
+    }
+  }
+}
+
+
+
 template <typename DESC>
 bool
 centered(const DESC &desc) {
@@ -307,6 +344,17 @@ private:
       this->texture_ = pResource->texture_.ptr();
       this->view_id_ = this->texture_->createView(descriptor);
       this->format_ = view_format;
+      switch (pDesc->Format) {
+      case DXGI_FORMAT_D16_UNORM:
+        this->depth_unorm_bits_ = 16;
+        break;
+      case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        this->depth_unorm_bits_ = 24;
+        break;
+      default:
+        this->depth_unorm_bits_ = 0;
+        break;
+      }
       this->pass_desc_ = attachment_desc;
       this->renamable_ = pResource->renamable_.ptr();
       this->readonly_flags_ = this->desc.Flags & 0b11;
@@ -321,6 +369,16 @@ private:
 
   Texture *
   viewTexture(DXGI_FORMAT format) {
+    // a SNORM view of BC4/BC5 blocks reads the companion's exact decode, whether the resource was made
+    // typeless or directly SNORM: the storage is the raw blocks either way, and Metal's own RSnorm view
+    // decodes the endpoints through a promotion that is not the formula the spec decodes them with
+    if ((format == DXGI_FORMAT_BC4_SNORM || format == DXGI_FORMAT_BC5_SNORM) &&
+        (this->desc.Format == DXGI_FORMAT_BC4_TYPELESS || this->desc.Format == DXGI_FORMAT_BC5_TYPELESS ||
+         this->texture_->pixelFormat() == WMTPixelFormatBC4_RUnorm ||
+         this->texture_->pixelFormat() == WMTPixelFormatBC5_RGUnorm)) {
+      RefreshBcSnormCompanion(this->texture_.ptr(), this->m_parent);
+      return this->texture_->bc_snorm.ptr();
+    }
     if (!this->texture_->chroma)
       return this->texture_.ptr();
     switch (format) {
@@ -461,6 +519,12 @@ public:
       ERR("DeviceTexture: Failed to create texture SRV");
       return hr;
     }
+    // a SNORM view of BC4/BC5 blocks reads the companion's exact decode: the raw storage's own RSnorm
+    // view decodes the endpoints through a promotion that is not the formula the spec decodes them with
+    if (finalDesc.Format == DXGI_FORMAT_BC4_SNORM)
+      descriptor.format = WMTPixelFormatR32Float;
+    else if (finalDesc.Format == DXGI_FORMAT_BC5_SNORM)
+      descriptor.format = WMTPixelFormatRG32Float;
     if (!ppView) {
       return S_FALSE;
     }

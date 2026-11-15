@@ -19,6 +19,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "wsi_platform.hpp"
 #include <limits>
 
 namespace mullion {
@@ -65,6 +66,13 @@ public:
       if (pDesc->Count > std::numeric_limits<size_t>::max() / result_size)
         return FAIL(E_OUTOFMEMORY);
       WMTBufferInfo info{uint64_t(pDesc->Count) * result_size, WMTResourceStorageModeShared};
+#ifdef __i386__
+      /* the CPU zeroes and later sums into the mapping, which Metal must not put past 4 GB */
+      results_host_ = std::shared_ptr<void>(wsi::aligned_malloc(info.length, MULLION_PAGE_SIZE), wsi::aligned_free);
+      if (!results_host_)
+        return FAIL(E_OUTOFMEMORY);
+      info.memory.set(results_host_.get());
+#endif
       results = metal.newBuffer(info);
       if (!results)
         return FAIL(E_OUTOFMEMORY);

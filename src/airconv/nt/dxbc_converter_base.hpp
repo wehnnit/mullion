@@ -484,6 +484,8 @@ public:
         ir.CreateSIToFP(ir.CreateTrunc(Metadata, ir.getInt16Ty()), air.getFloatTy()),
         llvm::ConstantFP::get(air.getFloatTy(), std::ldexp(1.0, -SM50_SAMPLER_METADATA_LOD_FRACTION_BITS))
     );
+    // which sampler's metadata this bias was read from: a sample whose only bias is this one biases Metal's LOD by
+    // the sampler's own value, and an anisotropic sample of it is the isotropic case below
     SamplerBiases[Bias] = Metadata;
     return Bias;
   }
@@ -505,24 +507,23 @@ public:
 
   // a sample whose LOD comes from its quad's derivatives, with `Bias` and `MinLOD`, of `Reference` when it compares.
   // Metal biases the footprint's minor axis before an anisotropic filter clamps the footprint's ratio, which can undo
-  // the bias; D3D biases the LOD of the clamped footprint ("biasedLOD = output.LOD + MipLODBias", D3D11.3 7.18.11).
-  // so a pixel shader's sample of a 2D texture through a sampler that may be anisotropic scales its gradients
-  // instead, which keeps the ratio, and one through a sampler that is not keeps Metal's LOD and bias. a static
-  // sampler's anisotropy and bias are known when the pipeline is made (SamplerDescriptor): KnownSamplers holds them by
-  // the sampler's metadata, and SamplerBiases the metadata each bias DecodeSamplerBias made was read from, which a
-  // sample may add its own to. a descriptor's sampler is known only from its metadata, and its quad branches on it
-  struct KnownSampler {
-    bool Anisotropic, Biased;
-  };
-  std::map<llvm::Value *, KnownSampler> KnownSamplers;
+  // the bias and, at a grazing angle, leaves the LOD too coarse even without one; D3D clamps the ratio first and
+  // biases the LOD of the clamped footprint ("biasedLOD = output.LOD + MipLODBias", D3D11.3 7.18.11). so a pixel
+  // shader's sample of a 2D texture through a sampler with a MaxAnisotropy above 1 scales its gradients instead, which
+  // keeps the ratio, and one through a sampler without keeps Metal's LOD and bias. a static sampler's anisotropy is
+  // known when the pipeline is made (SamplerDescriptor): KnownSamplers holds whether it is anisotropic by the
+  // sampler's metadata. a descriptor's sampler is known only from its metadata, and its quad branches on it
+  std::map<llvm::Value *, bool> KnownSamplers;
+  // the metadata each bias DecodeSamplerBias made was read from, so a sample can tell its sampler's own bias from
+  // one it computed itself
   std::map<llvm::Value *, llvm::Value *> SamplerBiases;
   // a static sampler's reduction, known when the pipeline is made, by its metadata: whether it is a minimum or
   // maximum filter (MinMaxFilter)
   std::map<llvm::Value *, bool> KnownReductions;
   void
   NoteSampler(const SamplerDescriptor &Descriptor) {
-    if (Descriptor.Anisotropic && Descriptor.Biased)
-      KnownSamplers[Descriptor.Metadata] = {*Descriptor.Anisotropic, *Descriptor.Biased};
+    if (Descriptor.Anisotropic)
+      KnownSamplers[Descriptor.Metadata] = *Descriptor.Anisotropic;
     if (Descriptor.Reduces)
       KnownReductions[Descriptor.Metadata] = *Descriptor.Reduces;
   }

@@ -5,7 +5,10 @@
 // and "clampedLOD = max(MinLOD,(min(MaxLOD, biasedLOD)))". mip m of each texture holds m, and anisotropic filters
 // are linear between mips (7.18.10), so a sample reads its LOD; a comparison passes where the reference is below the
 // texel (LESS), so references half a mip on either side of the expected LOD tell it apart. footprints are
-// axis-aligned powers of two, so every expected LOD is a whole mip. MaxAnisotropy 1 and a bias of 0 are controls.
+// axis-aligned powers of two, so every expected LOD is a whole mip. MaxAnisotropy 1 is the control. a bias of 0 with
+// a MaxAnisotropy above 1 is the grazing case: Metal clamps the ratio after its bias, which at a footprint longer than
+// MaxAnisotropy reads a mip too coarse (a smear) where D3D clamps the ratio first, so every Sample there is held to
+// the clamped footprint's LOD and no coarser.
 #include "d3d11_test.hpp"
 #include <algorithm>
 #include <bit>
@@ -13,7 +16,8 @@
 #include <iterator>
 
 // the footprints in texels of the first mip per pixel along x and y, one 2x2 quad each
-static const float footprints[][2] = {{16, 1}, {1, 16}, {4, 4}, {64, 4}, {2, 1}};
+// the last three are grazing, longer than MaxAnisotropy 4 and 16 by a factor of 2 to 32
+static const float footprints[][2] = {{16, 1}, {1, 16}, {4, 4}, {64, 4}, {2, 1}, {128, 1}, {1, 128}, {32, 2}};
 constexpr unsigned quads = std::size(footprints);
 
 static const char hlsl[] = R"hlsl(
@@ -48,6 +52,13 @@ lod(const float footprint[2], float anisotropy, float bias, unsigned mips) {
   float ratio = major * major / determinant;
   float minor = ratio > anisotropy ? major / anisotropy : determinant / major;
   return std::clamp(std::log2(minor) + bias, 0.0f, float(mips - 1));
+}
+
+// whether the footprint's ratio of anisotropy exceeds MaxAnisotropy, so that D3D clamps it (7.18.11)
+static bool
+is_grazing(const float footprint[2], UINT anisotropy) {
+  float major = std::max(footprint[0], footprint[1]);
+  return major * major / (footprint[0] * footprint[1]) > float(anisotropy);
 }
 
 int
@@ -125,6 +136,7 @@ main() {
   // which these headers lack)
   const float tolerance = std::ldexp(1.0f, -8);
   const char *names[targets] = {"Sample", "SampleBias", "SampleCmp below", "SampleCmp above"};
+  unsigned grazing = 0;
   for (UINT anisotropy : anisotropies)
     for (float bias : biases) {
       step("draw with MaxAnisotropy %u, MipLODBias %g", anisotropy, bias);
@@ -167,10 +179,18 @@ main() {
               float value = ((float *)((char *)mapped.pData + y * mapped.RowPitch))[x];
               expect(std::fabs(value - wants[k]) <= tolerance, "%s at pixel %u,%u (footprint %gx%g) read %g, expected %g",
                      names[k], x, y, footprints[q][0], footprints[q][1], value, wants[k]);
+              // a grazing footprint with no bias reads the LOD of the clamped footprint, not a coarser mip
+              if (k == 0 && bias == 0 && anisotropy > 1 && is_grazing(footprints[q], anisotropy)) {
+                grazing++;
+                expect(value <= wants[k] + tolerance, "Sample at pixel %u,%u smeared to %g at MaxAnisotropy %u, "
+                       "MipLODBias 0, footprint %gx%g, past the %g of the clamped footprint", x, y, value, anisotropy,
+                       footprints[q][0], footprints[q][1], wants[k]);
+              }
             }
         }
         context->Unmap(staging.Get(), k);
       }
     }
+  expect(grazing > 0, "no sample was grazing at MipLODBias 0");
   return verdict();
 }

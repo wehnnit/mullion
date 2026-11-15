@@ -27,6 +27,9 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import manifest as manifest_of  # noqa: E402  (tests/manifest.py: what a result belongs to)
+
 # what a test's last word and exit status make of it (tests/*/..._test.hpp)
 RESULTS = {"passed": 0, "skipped": 77}
 # a runner that is told to end ends as one that is interrupted: through its finally clauses
@@ -83,6 +86,18 @@ def builtin(pe):
 # the directories a Wine keeps its Direct3D-on-Metal libraries in apart from lib/wine, and loads them from in place of
 # those: MetalSharp's lib/mullion and CrossOver's lib/dxmt. a build installed only into lib/wine runs there unseen
 RUNTIMES = ("mullion", "dxmt")
+# every module this process installed into a Wine and where, by destination: the loader's record is checked against
+# these, so a file placed by hand or left by an earlier build is not mistaken for this build's (tests/manifest.py)
+INSTALLED = {}
+
+
+def installed(source, destination):
+    """record a module this run put into the Wine, with the build's hash and the installed file's, so the manifest can
+    say whether the loader saw this build's bytes or another file's"""
+    INSTALLED[str(destination)] = {"name": destination.name, "path": str(destination),
+                                  "sha256": manifest_of.sha256(destination),
+                                  "built": manifest_of.sha256(source),
+                                  "machine": manifest_of.machine(destination) if destination.suffix == ".dll" else "unix"}
 
 
 def install(wine, prefix, unix, pe):
@@ -95,19 +110,28 @@ def install(wine, prefix, unix, pe):
             continue
         # a 32-bit library's system directory in a 64-bit prefix is syswow64
         wow64 = windows / "syswow64"
-        shutil.copy2(path, wow64 if machine(path) == "i386" and wow64.is_dir() else windows / "system32")
+        destination = wow64 if machine(path) == "i386" and wow64.is_dir() else windows / "system32"
+        shutil.copy2(path, destination)
+        installed(path, destination / path.name)
         if builtin(path):
-            shutil.copy2(path, wine / "lib" / "wine" / f"{machine(path)}-windows")
+            destination = wine / "lib" / "wine" / f"{machine(path)}-windows"
+            shutil.copy2(path, destination)
+            installed(path, destination / path.name)
             for runtime in runtimes:
                 if (runtime / f"{machine(path)}-windows" / path.name).exists():
-                    shutil.copy2(path, runtime / f"{machine(path)}-windows")
+                    destination = runtime / f"{machine(path)}-windows"
+                    shutil.copy2(path, destination)
+                    installed(path, destination / path.name)
         if path.stem + ".so" in unix:
             # a WoW64 Wine runs a 32-bit library's unix side as the host's, from the one unix directory it has
-            own = wine / "lib" / "wine" / f"{machine(path)}-unix"
-            shutil.copy2(unix[path.stem + ".so"], own if own.is_dir() else next((wine / "lib" / "wine").glob("*-unix")))
+            own_unix = wine / "lib" / "wine" / f"{machine(path)}-unix"
+            destination = own_unix if own_unix.is_dir() else next((wine / "lib" / "wine").glob("*-unix"))
+            shutil.copy2(unix[path.stem + ".so"], destination / unix[path.stem + ".so"].name)
+            installed(unix[path.stem + ".so"], destination / unix[path.stem + ".so"].name)
             for runtime in runtimes:
                 for theirs in runtime.glob(f"*-unix/{path.stem}.so"):
                     shutil.copy2(unix[path.stem + ".so"], theirs)
+                    installed(unix[path.stem + ".so"], theirs)
 
 
 def clone(wine, to):
@@ -360,9 +384,15 @@ def compiler(builds):
 
 def named(file, offset):
     """the function and line the build's symbols give an offset in a module: the function the source has there, not
-    what the compiler put into it"""
-    said = subprocess.run([WHERE["symbolizer"], f"--obj={file}", "--relative-address", "-f", "-C", "-p", "-s", hex(offset)],
-                          capture_output=True, text=True).stdout.strip()
+    what the compiler put into it. a symbolizer that is missing or cannot read the module leaves the offset, which is
+    still where the thread was"""
+    if not WHERE.get("symbolizer"):
+        return hex(offset)
+    try:
+        said = subprocess.run([WHERE["symbolizer"], f"--obj={file}", "--relative-address", "-f", "-C", "-p", "-s", hex(offset)],
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout.strip()
+    except OSError:
+        return hex(offset)
     return said.splitlines()[-1].replace(" (inlined by) ", "") if said else hex(offset)
 
 
@@ -439,6 +469,16 @@ def arguments(parser):
     parser.add_argument("--clone", nargs="?", const=True, type=Path,
                         help="run in a copy of the Wine, made in this directory (default: tests-wine in the first build) "
                              "and installed into, never the Wine itself: for a signed Wine of another product")
+    parser.add_argument("--manifest", type=Path,
+                        help="write what the run's result belongs to there, instead of the attempt's own directory: the "
+                             "source and its uncommitted changes, the build's options and compilers, the Wine, the "
+                             "prefix's shader compilers, every module it installs and every one the Wine loaded, each by "
+                             "its hash")
+    parser.add_argument("--require-manifest", action="store_true",
+                        help="fail the run when the provenance manifest cannot be made, or does not prove that the "
+                             "build's modules are what the Wine loaded")
+    parser.add_argument("--no-probe", action="store_true",
+                        help="do not run the loader probe (no loader evidence: an acceptance run never uses this)")
     parser.add_argument("--compilers", type=Path,
                         help="a directory with Microsoft's shader compilers (d3dcompiler_47.dll, dxcompiler.dll and "
                              "dxil.dll, in any subdirectories: tests/compilers.py makes one), put into the prefix by "
@@ -597,9 +637,12 @@ def environment(args):
     for source in [chosen] if chosen else [builds[0] / "tests-compilers", wine / "share" / "wine" / "shadercompilers"]:
         if source.is_dir():
             install_compilers(source, wine, prefix, replace=chosen is not None)
+    # the build's own compiler, resolved by the version it was configured with (tests/manifest.py), so the
+    # symbolizer beside it is the toolchain that made the modules, not another compiler of the same name on PATH
+    built = manifest_of.build(builds[0]).get("compilers", {}).get("c", {})
+    symbolizer = str(Path(built["path"]).parent / "llvm-symbolizer") if built.get("path") else None
     WHERE.update(tool=[binary, *sorted(path for build in builds for path in build.glob("tests/*/where.exe"))][:2],
-                 files={path.name.lower(): path for path in pe.values()},
-                 symbolizer=Path(shutil.which(compiler(builds)[0])).resolve().parent / "llvm-symbolizer")
+                 files={path.name.lower(): path for path in pe.values()}, symbolizer=symbolizer)
     return builds, binary, base
 
 
@@ -622,26 +665,71 @@ def explain(lines, most=6):
 
 
 def signature(said, log):
-    """what a result is known by: what the test said, but for the time a hung one ran, and which results were wrong,
-    so two failures of one count are two failures"""
-    said = re.sub(r"^still running after \d+ s:.*", "still running", said)
-    wrong = sorted({line for line in log.read_text(errors="replace").splitlines() if line.startswith("wrong: ")})
+    """what a result is known by: what the test said, and which results were wrong, so two failures of one count are
+    two failures. a test that outlived its time is known by where its threads were, not by the time it ran, and not by
+    whatever it printed before it stopped: the stuck location is the whole of what a hang says"""
+    lines = log.read_text(errors="replace").splitlines()
+    if said.startswith("still running"):
+        # where the threads were, as the modules and functions they were in: the count beside each varies between runs
+        # of one artifact, so it is left out and two hangs at the same places are one identity
+        places = set()
+        for line in lines:
+            if not line.startswith("stuck: "):
+                continue
+            for place in line[len("stuck: "):].split("; "):
+                found = re.search(r"in (\S+): (.*?) at ", place)
+                if found:
+                    places.add((found[1], found[2]))
+        said = "still running"
+        return said + (f" [{hashlib.sha256(chr(10).join(sorted(': '.join(p) for p in places)).encode()).hexdigest()[:8]}]" if places else "")
+    wrong = sorted({line for line in lines if line.startswith("wrong: ")})
     return said + (f" [{hashlib.sha256(chr(10).join(wrong).encode()).hexdigest()[:8]}]" if wrong else "")
 
 
 def known(path=None):
-    """tests/known.txt: a line '<family> <test> <what it says> -- <cause>' for each failure or skip that is known. the
-    GPU's own family is 'native(<its chip>)', as another chip is other evidence. only a test that ran to its verdict,
-    or was skipped, can be known: one that stopped early (a check, a fault, a hang) hides every case after it"""
+    """tests/known.txt: a line '<family>[/<arch>] <test> <what it says> -- <cause>' for each failure or skip that is
+    known. the GPU's own family is 'native(<its chip>)', as another chip is other evidence. an optional /i386 or
+    /x86_64 names the PE the program is, so a 32-bit and a 64-bit run can keep different fingerprints of the same
+    Metal limit; a line without an arch matches every PE. only a test that ran to its verdict, or was skipped, can be
+    known: one that stopped early (a check, a fault, a hang) hides every case after it"""
     path = path or KNOWN
     entries = {}
     for number, line in enumerate(path.read_text().splitlines() if path.exists() else [], 1):
+        # a second separator is refused before anything else, because the verdict's pattern is greedy: the line still
+        # parses, with the first half of the cause captured as part of the verdict, so it matches nothing and reports
+        # its own line back as the expectation. the file looks populated and governs nothing
+        if line.strip() and not line.startswith("#") and line.count(" -- ") > 1:
+            sys.exit(f"{path}:{number}: two \" -- \" separators. the verdict is compared for equality, and its pattern "
+                     "is greedy, so the extra one is swallowed into the verdict: the line parses, matches nothing, and "
+                     "silently stops governing its test. write the cause with semicolons")
         if line.strip() and not line.startswith("#"):
-            fields = re.fullmatch(r"(native\(.*?\)|\S+) (\S+) (failed: \d+ wrong results \[[0-9a-f]{8}\]|skipped: .+) -- (.*\S.*)", line)
+            # a known line holds the exact words the suite printed for a non-pass: the usual
+            # 'failed: N wrong results [hash]', a skip, a CHECK failure, a tiled mismatch count, a hang, or an
+            # exit-status line. the cause after -- is what makes it known rather than new
+            fields = re.fullmatch(
+                # a chip's name carries brackets of its own ("Apple M1 (Virtual)"), so the group allows one nested
+                # pair; the architecture is optional and a line without it holds for every PE machine
+                r"(native\((?:[^()]|\([^()]*\))*\)|\S+?)(?:/(i386|x86_64))? (\S+) "
+                r"(failed: .+|skipped: .+|still running(?: \[[0-9a-f]+\])?|exit status .+) -- (.*\S.*)",
+                line,
+            )
             if not fields:
-                sys.exit(f"{path}:{number}: not '<family> <test> <verdict or skip> -- <cause>'")
-            entries[fields[1], fields[2]] = fields[3]
+                # a count or a fingerprint that moves between runs of one artifact is unstable, not a new baseline:
+                # known.txt holds what a test says every time, so a line that records one run's drift is refused here
+                if re.match(r"\S+(?:/\S+)? \S+ unstable: ", line):
+                    sys.exit(f"{path}:{number}: 'unstable' is a failure class, not a known line: a test whose answer moves "
+                             "between runs of one artifact has no identity to be known by, and is reported as new with its "
+                             "runs (--repeat) until it gives one answer")
+                sys.exit(f"{path}:{number}: not '<family>[/<arch>] <test> <verdict or skip> -- <cause>'")
+            entries[fields[1], fields[3], fields[2]] = fields[4]
     return entries
+
+
+def known_said(listed, family, name, arch):
+    """what known.txt says for this family, test and PE: an arch-specific line first, then one with no arch"""
+    if (family, name, arch) in listed:
+        return listed[family, name, arch]
+    return listed.get((family, name, None))
 
 
 def options(parser):
@@ -682,13 +770,63 @@ def chosen(args):
     return tests
 
 
+def attempt_directory(build, identity, benchmark=False):
+    """the directory this attempt's logs and manifest go in: one per artifact identity, and a new attempt beside the
+    earlier ones, so a second run of one artifact never overwrites the only record of a first result"""
+    runs = Path(build) / "meson-logs" / ("benchmarks" if benchmark else "runs") / identity[:16]
+    runs.mkdir(parents=True, exist_ok=True)
+    attempt = 1
+    while (runs / f"attempt-{attempt}").exists():
+        attempt += 1
+    directory = runs / f"attempt-{attempt}"
+    directory.mkdir(parents=True)
+    return directory
+
+
+def listed_by(args):
+    """the failures and skips this run compares with, and where they are: decided before any test runs, because a gate
+    that cannot say what is known has not run. a validated run compares against its own list, made from a reviewed run
+    (--record) and installed as tests/known-validated.txt; a missing list is a missing comparison, never an empty one,
+    so a validated run that would otherwise report '0 known' says why it cannot instead. --record writes such a list,
+    so it is the one mode that runs without one"""
+    default = KNOWN_VALIDATED if getattr(args, "validate", False) else KNOWN
+    path = getattr(args, "known", None) or default
+    if not path.exists():
+        if getattr(args, "record", None):
+            print(f"known: none at {path}: this run records one, to be reviewed and installed as {path.name}", flush=True)
+        else:
+            sys.exit(f"no such file: {path}" + (
+                "\n  a validated run needs the list a reviewed run recorded (--record) and that was then installed as "
+                f"tests/{KNOWN_VALIDATED.name}: without it a run cannot tell a fixed failure from a missing list"
+                if path == KNOWN_VALIDATED else ""))
+    return path, known(path)
+
+
 def own(args, tests, builds, binary, base):
     """runs the build's tests as each family; how many results tests/known.txt does not hold"""
     if args.late is not None and args.late < 0:
         sys.exit("--late must be nonnegative milliseconds")
-    logs = builds[0] / "meson-logs" / ("benchmarks" if getattr(args, "benchmark", False) else "tests")
-    logs.mkdir(parents=True, exist_ok=True)
-    # a test's flight records (WMTFlightDump) go with its logs, not where a game's go (~/Library/Logs/Mullion)
+    path, listed = listed_by(args)
+    # what this run's numbers belong to (docs/TESTING.md, section 3): a result that names no artifact is no evidence.
+    # the identity is derived from the source and the artifacts alone, so two runs of one artifact name the same
+    # directory; each attempt gets its own beside the others, and a later attempt never overwrites an earlier log
+    unix, pe = libraries(builds)
+    prefix = Path(base.get("WINEPREFIX") or builds[0] / "tests-prefix")
+    evidence = {} if getattr(args, "no_probe", False) else manifest_of.probe(builds, binary, prefix, base)
+    said = manifest_of.manifest(builds, binary, prefix, unix, pe, base, tests=tests, installed=INSTALLED,
+                                loaded_=evidence)
+    identity = manifest_of.digest(said)
+    logs = attempt_directory(builds[0], identity, benchmark=getattr(args, "benchmark", False))
+    manifest_of.write(said, getattr(args, "manifest", None) or logs / "manifest.json")
+    complaints = manifest_of.verify(said)
+    for complaint in complaints:
+        print(f"manifest: {complaint}", file=sys.stderr, flush=True)
+    if complaints and getattr(args, "require_manifest", False):
+        sys.exit("manifest: the record does not prove what ran: " + "; ".join(complaints))
+    # a test's flight records (WMTFlightDump) go with its logs, not where a game's go (~/Library/Logs/Mullion).
+    # this is set after the manifest is written on purpose: manifest.py records every MULLION_* variable, and
+    # MULLION_DIAG_PATH is now the attempt directory whose name is that record's own digest, so setting it first
+    # would put the identity inside the data the identity is hashed from.
     base = dict(base)
     base.setdefault("MULLION_DIAG_PATH", str(logs))
     families = args.family.split(",")
@@ -773,23 +911,58 @@ def own(args, tests, builds, binary, base):
         reasons = sorted(set(not_run.values()))
         print(f"\n{len(not_run)} tests not run: " + "; ".join(
             f"{reason} ({sum(why == reason for why in not_run.values())})" for reason in reasons), flush=True)
-    print(f"\n{counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; logs in {logs}")
+    # two different questions, kept apart: did the actual test pass on this artifact, and did its result change
+    # against the reviewed baseline. a baseline match never turns a failure into a pass, and an improvement is
+    # reported as one rather than as a rendering failure
+    print(f"\nactual: {counts['passed']} passed, {counts['failed']} failed, {counts['skipped']} skipped; "
+          f"identity {identity[:16]}, logs in {logs}")
 
     chip = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip()
-    default = KNOWN_VALIDATED if getattr(args, "validate", False) else KNOWN
-    path = getattr(args, "known", None) or default
-    if path != default and not path.exists():
-        sys.exit(f"no such file: {path}")
-    listed = known(path)
-    ran = {(f"native({chip})" if family == "native" else family, name): (verdict, said_by[name, family])
-           for (name, family), verdict in verdicts.items()}
-    new = [f"{family} {name} {said}" + (f" (known: {listed[family, name]})" if (family, name) in listed else "")
-           for (family, name), (verdict, said) in ran.items() if verdict != "passed" and listed.get((family, name)) != said]
-    fixed = [f"{family} {name}" for (family, name) in listed if ran.get((family, name), ("",))[0] == "passed"]
-    print(f"{sum(verdict != 'passed' for verdict, _ in ran.values()) - len(new)} known, each with its cause in {path}")
+    # each PE keeps its own known line when the fingerprints differ (32-bit vs 64-bit interpolants of the same Metal
+    # limit); host tests have no PE arch
+    def pe_arch(name):
+        path = next((Path(t["cmd"][0]) for t in tests if t["name"] == name), None)
+        return machine(path) if path and path.suffix == ".exe" else None
+
+    ran = {}
+    for (name, family), verdict in verdicts.items():
+        label = f"native({chip})" if family == "native" else family
+        arch = pe_arch(name)
+        ran[label, name, arch] = (verdict, said_by[name, family])
+    new = []
+    for (family, name, arch), (verdict, said) in ran.items():
+        if verdict == "passed":
+            continue
+        expect = known_said(listed, family, name, arch)
+        if expect == said:
+            continue
+        shown = f"{family}/{arch}" if arch else family
+        note = f" (known: {expect})" if expect else ""
+        new.append(f"{shown} {name} {said}{note}")
+    fixed = []
+    for (family, name, arch), said in listed.items():
+        # a line with no arch is fixed only when every PE that ran this test now passes; an arch-specific line is
+        # fixed when that PE passes
+        matches = [(a, v) for (f, n, a), (v, _) in ran.items() if f == family and n == name and (arch is None or a == arch)]
+        if matches and all(v == "passed" for _, v in matches):
+            shown = f"{family}/{arch}" if arch else family
+            fixed.append(f"{shown} {name}")
+    unchanged = sum(1 for (family, name, arch), (verdict, said) in ran.items()
+                    if verdict != "passed" and known_said(listed, family, name, arch) == said)
+    print(f"baseline: {unchanged} unchanged non-passes with their cause in {path}, {len(new)} new or changed, "
+          f"{len(fixed)} now passing")
+    # a family the file holds no line for cannot have any of its results matched, so every non-pass there is reported
+    # new -- which reads like a regression when it is the absence of a baseline. run.py's default names seven families
+    # and the reviewed file governs the ones this says, so this is printed rather than left for the reader to infer
+    governed = {family for (family, _, _) in listed}
+    for family in sorted({f for (f, _, _) in ran} - governed):
+        print(f"baseline: {path.name} holds no line for family {family}: its results are measured but not governed, "
+              "and a non-pass there is new because nothing was ever reviewed for this family")
     if getattr(args, "record", None):
-        args.record.write_text("".join(f"{family} {name} {said} -- what {builds[0].name} said\n"
-                                       for (family, name), (verdict, said) in ran.items() if verdict != "passed"))
+        args.record.write_text("".join(
+            f"{family}{f'/{arch}' if arch else ''} {name} {said} -- what {builds[0].name} said\n"
+            for (family, name, arch), (verdict, said) in ran.items() if verdict != "passed"
+        ))
     for line in new:
         print(f"new: {line}")
     for line in fixed:

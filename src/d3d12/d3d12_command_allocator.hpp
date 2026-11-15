@@ -127,11 +127,13 @@ struct IndirectRenderCommandData {
   uint64_t depth_ranges, raster_scale;
   uint64_t statistics;
   // with stream output, each command's SM50_STREAM_OUTPUT_TARGETS, whose grid the resolver fills in, zero otherwise;
-  // the scratch area they share and the geometry invocations of an object threadgroup, which bound a command's grid;
-  // and a word for each command, the scratch it needed when it had not that much
+  // the scratch area they share and the geometry invocations of an object threadgroup, which bound a command's grid,
+  // and of those counts the ones zeroed (tessellation_stream_output_zeroed); and a word for each command, the scratch
+  // it needed when it had not that much
   uint64_t so_targets;
   uint64_t so_scratch_size;
   uint32_t so_invocations;
+  uint32_t so_zeroed;
   uint64_t so_lacked;
   uint32_t statistics_first, statistics_step, statistics_cut, statistics_cuts;
   WMTIndirectCommandBufferExecutionRange execution_range;
@@ -232,6 +234,7 @@ private:
 
   WMT::Reference<WMT::ComputePipelineState> d24_copy_pso_[2];
   RGB32Copy<MTLD3D12CommandAllocatorImpl> rgb32_copy_{*this};
+  BCSnormDecode<MTLD3D12CommandAllocatorImpl> bc_snorm_decode_{*this};
   ClearUAV<MTLD3D12CommandAllocatorImpl> clear_uav_;
   // a UAV clear joins the open compute pass, behind and before memory barriers, instead of a pass of its own
   // (startComputePass, endPass)

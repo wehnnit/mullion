@@ -1563,6 +1563,30 @@ Converter::operator()(const InstLoad &load) {
   StoreFeedback(load.feedback, Residency);
 }
 
+// Apple's BC4/BC5 signed decoder returns -1/8128 where D3D11.3 19.5.2 requires exact 0
+template <typename Builder>
+static llvm::Value *
+SnapBcSnorm(Builder &B, llvm::Value *Metadata, llvm::Value *Value) {
+  auto *Ty = Value->getType();
+  if (!Ty->getScalarType()->isFloatTy())
+    return Value;
+  auto *Bit = B.CreateICmpNE(B.CreateAnd(Metadata, B.getInt64(SM50_TEXTURE_METADATA_BC_SNORM)), B.getInt64(0));
+  // Apple returns k/8128 for k = 1, 2 and 8 where D3D11.3 19.5.2 requires 0. 9/8128 is a real
+  // 8-mode step (below 1/(127*7) only in the float the hardware returns), so the cut sits between them.
+  auto *Limit = llvm::ConstantFP::get(Ty->getScalarType(), 8.5 / 8128.0);
+  auto *Zero = llvm::ConstantFP::get(Ty->getScalarType(), 0.0);
+  auto snap = [&](llvm::Value *C) {
+    auto *Abs = B.CreateSelect(B.CreateFCmpOLT(C, Zero), B.CreateFNeg(C), C);
+    return B.CreateSelect(B.CreateAnd(Bit, B.CreateFCmpOLT(Abs, Limit)), Zero, C);
+  };
+  if (auto *Vec = llvm::dyn_cast<llvm::FixedVectorType>(Ty)) {
+    for (unsigned i = 0; i < Vec->getNumElements(); i++)
+      Value = B.CreateInsertElement(Value, snap(B.CreateExtractElement(Value, uint64_t(i))), i);
+    return Value;
+  }
+  return snap(Value);
+}
+
 // Metal takes a writable sparse texture's residency coordinates in tiles of a 16 KB page
 llvm::Value *
 Converter::WritableResidency(
@@ -1618,6 +1642,7 @@ Converter::ReadTexel(
 ) {
   auto [Value, Residency] =
       air.CreateRead(Tex.Texture, Tex.Handle, Address, ArrayIndex, SampleIndex, Level, Tex.GlobalCoherent);
+  Value = SnapBcSnorm(ir, Tex.Metadata, Value);
   if (Tex.Range && Residency && !Tex.IsUAV && !SampleIndex && Address->getType()->isVectorTy())
     Residency = WritableResidency(Tex, Address, ArrayIndex, Level, Residency);
   if (Tex.Logical != llvm::air::Texture::texture_buffer || Tex.IsUAV || !(Used & (kMaskComponentY | kMaskComponentZ)))
@@ -1648,7 +1673,7 @@ Converter::ReadTexel(
   auto Merged = ir.CreatePHI(Value->getType(), 2);
   Merged->addIncoming(Value, From);
   Merged->addIncoming(Wide, Read);
-  return {Merged, Residency};
+  return {SnapBcSnorm(ir, Tex.Metadata, Merged), Residency};
 }
 
 void
@@ -1856,7 +1881,7 @@ Converter::operator()(const InstSample &sample) {
       {.Bias = Sampler->Bias, .MinLOD = MinLODClamp}, {Value, Residency}
   );
 
-  StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreOperand(sample.dst, MaskSwizzle(SnapBcSnorm(ir, Tex->Metadata, Value), GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
 
@@ -1933,7 +1958,7 @@ Converter::operator()(const InstSampleLOD &sample) {
       {.Level = Explicit}, {Value, Residency}
   );
 
-  StoreOperand(sample.dst, MaskSwizzle(Value, GetMask(sample.dst), Tex->Swizzle));
+  StoreOperand(sample.dst, MaskSwizzle(SnapBcSnorm(ir, Tex->Metadata, Value), GetMask(sample.dst), Tex->Swizzle));
   StoreFeedback(sample.feedback, Residency);
 }
 
@@ -2466,15 +2491,6 @@ Converter::SampleImplicit(
   }();
   if (!Planar || ctx.shader_type != microsoft::D3D10_SB_PIXEL_SHADER || !Exact)
     return Biased();
-  // a static sampler is known when the pipeline is made: one that is not anisotropic, or a sample whose only bias is
-  // the sampler's own and that is none, reads Metal's own LOD. Metal's gradient sample below costs about twice its
-  // implicit one (the probe's sample scenes on an M4)
-  if (auto Known = KnownSamplers.find(SamplerMetadata); Known != KnownSamplers.end()) {
-    auto Own = SamplerBiases.find(Bias);
-    if (!Known->second.Anisotropic ||
-        (!Known->second.Biased && Own != SamplerBiases.end() && Own->second == SamplerMetadata))
-      return Biased();
-  }
   auto Anisotropy = ir.CreateAnd(ir.CreateLShr(SamplerMetadata, SM50_SAMPLER_METADATA_ANISOTROPY),
                                  (1 << SM50_SAMPLER_METADATA_ANISOTROPY_BITS) - 1);
   auto Isotropic = ir.CreateICmpULE(Anisotropy, ir.getInt64(1));
@@ -2489,6 +2505,11 @@ Converter::SampleImplicit(
     return air.CreateSampleGrad(Tex.Texture, Tex.Handle, Sampler, Coord, ArrayIndex, BiasGradient(DDX, Bias),
                                 BiasGradient(DDY, Bias), MinLOD, Offset, Reference);
   };
+  // a static sampler is known when the pipeline is made: one that is not anisotropic reads Metal's own LOD, and one
+  // that is takes the gradients whatever its bias, as Metal clamps the ratio after its bias where D3D clamps it first.
+  // Metal's gradient sample costs about twice its implicit one (the probe's sample scenes on an M4)
+  if (auto Known = KnownSamplers.find(SamplerMetadata); Known != KnownSamplers.end())
+    return Known->second ? Gradients() : Biased();
   // MULLION_AIRCONV_SKIP=table-sampler-implicit: a sampler not known here always takes the gradients
   static const bool Selects = [] {
     auto Skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
@@ -3192,8 +3213,8 @@ Converter::CustomBorder(
 ) {
   using namespace llvm;
   using namespace llvm::air;
-  // D3D's cubes ignore address modes
-  if (!Border || air.noCustomBorder() || !Tex.Range || AIRBuilder::getTextureInfo(Tex.Logical).is_cube)
+  // D3D's cubes ignore address modes. a missing format range (D3D11 SM50 textures) leaves the color unclamped
+  if (!Border || air.noCustomBorder() || AIRBuilder::getTextureInfo(Tex.Logical).is_cube)
     return Value;
   // only samplers with a border pay for it
   auto Head = ir.GetInsertBlock();
@@ -3210,16 +3231,19 @@ Converter::CustomBorder(
   auto TyBorder = StructType::get(ctx.llvm, {air.getSamplerHandleType(), ir.getInt64Ty(), air.getFloatTy(4)});
   auto Ptr = ir.CreateIntToPtr(Border, TyBorder->getPointerTo(2));
   auto White = ir.CreateLoad(TyBorder->getElementType(0), ir.CreateStructGEP(TyBorder, Ptr, 0));
-  auto Range = ir.CreateLoad(air.getFloatTy(2), ir.CreatePointerCast(Tex.Range, air.getFloatTy(2)->getPointerTo(2)));
-  auto Clamp = [&](llvm::Value *V) {
-    auto Bound = [&](uint64_t i) {
-      auto B = ir.CreateExtractElement(Range, i);
-      auto Ty = dyn_cast<FixedVectorType>(V->getType());
-      return Ty ? ir.CreateVectorSplat(Ty->getNumElements(), B) : B;
+  llvm::Value *Color = ir.CreateLoad(TyBorder->getElementType(2), ir.CreateStructGEP(TyBorder, Ptr, 2));
+  if (Tex.Range) {
+    auto Range = ir.CreateLoad(air.getFloatTy(2), ir.CreatePointerCast(Tex.Range, air.getFloatTy(2)->getPointerTo(2)));
+    auto Clamp = [&](llvm::Value *V) {
+      auto Bound = [&](uint64_t i) {
+        auto B = ir.CreateExtractElement(Range, i);
+        auto Ty = dyn_cast<FixedVectorType>(V->getType());
+        return Ty ? ir.CreateVectorSplat(Ty->getNumElements(), B) : B;
+      };
+      return air.CreateFPBinOp(AIRBuilder::fmin, air.CreateFPBinOp(AIRBuilder::fmax, V, Bound(0)), Bound(1));
     };
-    return air.CreateFPBinOp(AIRBuilder::fmin, air.CreateFPBinOp(AIRBuilder::fmax, V, Bound(0)), Bound(1));
-  };
-  auto Color = Clamp(ir.CreateLoad(TyBorder->getElementType(2), ir.CreateStructGEP(TyBorder, Ptr, 2)));
+    Color = Clamp(Color);
+  }
 
   // per channel, the white and black reads differ by the border's weight
   auto Black = Reference ? Read(Sampler) : Value;
@@ -3232,7 +3256,20 @@ Converter::CustomBorder(
   llvm::Value *Fixed;
   if (Reference) {
     // the border's weight moves from the comparison with Metal's 0 to the one with the color's red
-    auto Clamped = Clamp(Reference);
+    llvm::Value *Clamped = Color; // already clamped above when Tex.Range is set
+    if (Tex.Range) {
+      auto Range = ir.CreateLoad(air.getFloatTy(2), ir.CreatePointerCast(Tex.Range, air.getFloatTy(2)->getPointerTo(2)));
+      auto Bound = [&](uint64_t i) {
+        auto B = ir.CreateExtractElement(Range, i);
+        auto Ty = dyn_cast<FixedVectorType>(Reference->getType());
+        return Ty ? ir.CreateVectorSplat(Ty->getNumElements(), B) : B;
+      };
+      Clamped = air.CreateFPBinOp(
+          AIRBuilder::fmin, air.CreateFPBinOp(AIRBuilder::fmax, Reference, Bound(0)), Bound(1)
+      );
+    } else {
+      Clamped = Reference;
+    }
     auto Change = ir.CreateFSub(
         SamplerCompare(SamplerMetadata, Clamped, ir.CreateExtractElement(Color, uint64_t(0))),
         SamplerCompare(SamplerMetadata, Clamped, ConstantFP::get(air.getFloatTy(), 0))

@@ -3,6 +3,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d11.h"
 #include "log/log.hpp"
+#include "../mullion/mullion_router.hpp"
 
 namespace mullion {
 Logger Logger::s_instance("d3d10core.log");
@@ -17,6 +18,10 @@ D3D10CoreCreateDevice(
     IDXGIFactory *pFactory, IDXGIAdapter *pAdapter, UINT Flags, D3D_FEATURE_LEVEL FeatureLevel, ID3D10Device **ppDevice
 ) {
   InitReturnPtr(ppDevice);
+
+  // the level the request names is part of what the record says the title asked for
+  if (!router::offered(router::Request{router::Api::D3D10, false, false, uint32_t(FeatureLevel)}))
+    return E_NOINTERFACE;
 
   Com<ID3D11Device> d3d11_device;
 
@@ -37,7 +42,9 @@ D3D10CoreCreateDevice(
   if (Flags & D3D10_CREATE_DEVICE_DEBUGGABLE)
     d3d11_flags |= D3D11_CREATE_DEVICE_DEBUGGABLE;
 
-  hr = D3D11CoreCreateDevice(pFactory, pAdapter, d3d11_flags | 0x80000000 /* MULLION_D3D10_DEVICE */, &FeatureLevel, 1, &d3d11_device);
+  // this build's own asker: the bit says so and the router leaves the call alone (d3d11.cpp's MULLION_D3D10_DEVICE)
+  hr = D3D11CoreCreateDevice(pFactory, pAdapter, d3d11_flags | 0x80000000 /* MULLION_D3D10_DEVICE */, &FeatureLevel, 1,
+                             &d3d11_device);
 
   if (FAILED(hr))
     return hr;
@@ -47,6 +54,12 @@ D3D10CoreCreateDevice(
   multithread->SetMultithreadProtected(!(Flags & D3D10_CREATE_DEVICE_SINGLETHREADED));
 
   return d3d11_device->QueryInterface(IID_PPV_ARGS(ppDevice));
+}
+
+// undocumented and without arguments: the value Windows 10's d3d10core.dll answers (as DXVK answers it)
+extern "C" UINT64 STDMETHODCALLTYPE
+D3D10CoreGetVersion() {
+  return 0xa000100041770ull;
 }
 
 extern "C" HRESULT STDMETHODCALLTYPE

@@ -57,6 +57,11 @@ main(int argc, char **argv) {
     const char *args[] = {"env", setting.c_str(), loader_path, exe, argc > 1 ? argv[1] : "dxil", "child", nullptr};
     const auto status = spawn(const_cast<char *const *>(args), TRUE);
     HeapFree(GetProcessHeap(), 0, loader_path);
+    if (status == 77) {
+      // the child skipped (the router refused its Direct3D 12), which is this run's verdict too
+      printf("skipped: the late child could not make its Direct3D 12 device\n");
+      return verdict_skipped("the child could not make its Direct3D 12 device");
+    }
     expect(status == 0, "late child ended with %ld", status);
     SetEvent(finished);
     expect(WaitForSingleObject(watchdog, timeout_ms) == WAIT_OBJECT_0, "watchdog ended");
@@ -217,7 +222,7 @@ main(int argc, char **argv) {
   step("seed=%u D3D12 queue fence covers copied bytes and allocator reuse", seed);
   {
     ComPtr<ID3D12Device> d3d;
-    CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d3d)));
+    CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d3d)));
     ComPtr<ID3D12CommandQueue> queue;
     D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
     CHECK(d3d->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue)));

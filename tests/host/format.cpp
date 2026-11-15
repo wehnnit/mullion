@@ -6,8 +6,9 @@
 int
 main() {
   using mullion::str::format;
-  unsigned failures = 0;
+  unsigned failures = 0, checks = 0;
   auto check = [&](const std::string &got, const std::string &want) {
+    checks++;
     if (got != want)
       failures++, std::printf("got \"%s\", want \"%s\"\n", got.c_str(), want.c_str());
   };
@@ -16,6 +17,7 @@ main() {
     check(format("x", uint8_t(value), 'y'), "x" + std::to_string(value) + "y");
   }
   check(format('a', "b"), "ab");
-  std::printf("%s: %u wrong results\n", failures ? "failed" : "passed", failures);
+  // the runner reads a result line (tests/run.py): a test that exits without one has not said whether it passed
+  std::printf("%s: %u wrong of %u checks\n", failures ? "failed" : "passed", failures, checks);
   return failures != 0;
 }

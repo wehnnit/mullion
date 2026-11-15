@@ -3,12 +3,14 @@
 
 #ifdef __cplusplus
 #include <cstdint>
+#include <cstddef>
 #include <cassert>
-#define STATIC_ASSERT(x) static_assert(x)
+#define STATIC_ASSERT(x) static_assert(x, #x)
 #else
 #include <stdint.h>
 #include <stdbool.h>
-#define STATIC_ASSERT(x)
+#include <stddef.h>
+#define STATIC_ASSERT(x) _Static_assert(x, #x)
 #endif
 
 #ifdef _WIN32
@@ -193,8 +195,8 @@ struct WMTConstMemoryPointer {
 #define WMT_MEMPTR_SET(obj, value) obj.ptr = value
 #endif
 
-STATIC_ASSERT(sizeof(WMTMemoryPointer) == 8);
-STATIC_ASSERT(sizeof(WMTConstMemoryPointer) == 8);
+STATIC_ASSERT(sizeof(struct WMTMemoryPointer) == 8);
+STATIC_ASSERT(sizeof(struct WMTConstMemoryPointer) == 8);
 
 struct WMTBufferInfo {
   uint64_t length;                 // in
@@ -203,7 +205,7 @@ struct WMTBufferInfo {
   uint64_t gpu_address;            // out
 };
 
-STATIC_ASSERT(sizeof(WMTBufferInfo) == 32);
+STATIC_ASSERT(sizeof(struct WMTBufferInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newBuffer(obj_handle_t device, struct WMTBufferInfo *info);
 
@@ -270,7 +272,7 @@ struct WMTSamplerInfo {
   uint64_t gpu_resource_id; // out
 };
 
-STATIC_ASSERT(sizeof(WMTSamplerInfo) == 32);
+STATIC_ASSERT(sizeof(struct WMTSamplerInfo) == 32);
 
 WINEMETAL_API obj_handle_t MTLDevice_newSamplerState(obj_handle_t device, struct WMTSamplerInfo *info);
 
@@ -1941,6 +1943,59 @@ MTLCommandBuffer_encodeDenoisedScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, const struct WMTFXDenoisedScaleArgs *args, bool metal4
 );
 
+/* MetalFX frame interpolation (MTLFXFrameInterpolator, macOS 26): the frame between two the game showed. Apple's
+ * descriptor takes the scaler whose history it reads -- "scaler", of type MTLFXFrameInterpolatableScaler, which both
+ * MTLFXTemporalScalerBase and MTLFXTemporalDenoisedScalerBase conform to, Metal 4 objects included, so one handle
+ * serves either kind and frame generation composes with the upscaling above rather than replacing it. That is how
+ * NGX's FGF is shaped too. A scaler handle of 0 interpolates the game's own frames; a format of
+ * WMTPixelFormatInvalid leaves an optional input out. Unlike the scalers, this descriptor has no
+ * requiresSynchronousInitialization to carry */
+struct WMTFXFrameInterpolatorInfo {
+  enum WMTPixelFormat color_format;
+  enum WMTPixelFormat depth_format;
+  enum WMTPixelFormat motion_format;
+  enum WMTPixelFormat output_format;
+  enum WMTPixelFormat ui_format; /* optional */
+  obj_handle_t scaler;           /* a scaler made above, either Metal 3 or Metal 4, or 0 */
+  uint32_t input_width;
+  uint32_t input_height;
+  uint32_t output_width;
+  uint32_t output_height;
+};
+
+/* false where the device has no MetalFX frame interpolation: Apple's own scalers want Apple9 or newer */
+WINEMETAL_API bool MTLDevice_supportsFXFrameInterpolator(obj_handle_t device, bool metal4);
+
+/* 0 where the device has none; metal4: an interpolator that Metal 4 command buffers can encode */
+WINEMETAL_API obj_handle_t
+MTLDevice_newFrameInterpolator(obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info, bool metal4);
+
+/* One interpolated frame: the two the game showed, their depth and motion, and where to write them. A handle of 0
+ * leaves an optional input out (ui and fence are); color, prev_color, depth, motion and output are what Apple asks
+ * for. This encodes into a Metal 3 command buffer only: the Metal 4 form needs the closeCompute and metal4_resident
+ * plumbing a scaler's takes (see _MTLCommandBuffer_encodeDenoisedScale) and has no entry point here rather than one
+ * that quietly does nothing */
+struct WMTFXFrameInterpolateArgs {
+  obj_handle_t color;
+  obj_handle_t prev_color;
+  obj_handle_t depth;
+  obj_handle_t motion;
+  obj_handle_t ui;     /* optional */
+  obj_handle_t output;
+  obj_handle_t fence;  /* optional */
+  float motion_vector_scale_x;
+  float motion_vector_scale_y;
+  float jitter_offset_x;
+  float jitter_offset_y;
+  float delta_time;
+  bool reset;
+  bool depth_reversed;
+};
+
+WINEMETAL_API void MTLCommandBuffer_encodeFrameInterpolation(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, const struct WMTFXFrameInterpolateArgs *args
+);
+
 /* MetalFX for Metal 4 command buffers (MTL4FXSpatialScaler): 0 where the device has none */
 WINEMETAL_API obj_handle_t MTLDevice_newSpatialScaler4(obj_handle_t device, const struct WMTFXSpatialScalerInfo *info);
 
@@ -1997,6 +2052,9 @@ struct WMTWindowPlacement {
   int32_t top_level_width, top_level_height;
   uint32_t screen_width;
 };
+STATIC_ASSERT(sizeof(struct WMTWindowPlacement) == 40);
+STATIC_ASSERT(offsetof(struct WMTWindowPlacement, x) == 8);
+STATIC_ASSERT(offsetof(struct WMTWindowPlacement, screen_width) == 32);
 
 WINEMETAL_API obj_handle_t CreateMetalViewFromHWND(
     intptr_t hwnd, const struct WMTWindowPlacement *placement, obj_handle_t device, obj_handle_t *layer
@@ -2404,7 +2462,7 @@ struct WMTHeapInfo {
   enum WMTSparsePageSize sparse_page_size;
 };
 
-STATIC_ASSERT(sizeof(WMTHeapInfo) == 24);
+STATIC_ASSERT(sizeof(struct WMTHeapInfo) == 24);
 
 WINEMETAL_API obj_handle_t MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info);
 
@@ -2498,7 +2556,7 @@ struct WMTAccelerationStructureGeometry {
   uint8_t padding[4];
 };
 
-STATIC_ASSERT(sizeof(WMTAccelerationStructureGeometry) == 72);
+STATIC_ASSERT(sizeof(struct WMTAccelerationStructureGeometry) == 72);
 
 struct WMTAccelerationStructureInfo {
   struct WMTMemoryPointer geometries; // WMTAccelerationStructureGeometry, of a primitive structure
@@ -2517,7 +2575,7 @@ struct WMTAccelerationStructureInfo {
   uint64_t refit_scratch_size;
 };
 
-STATIC_ASSERT(sizeof(WMTAccelerationStructureInfo) == 80);
+STATIC_ASSERT(sizeof(struct WMTAccelerationStructureInfo) == 80);
 
 WINEMETAL_API void MTLDevice_accelerationStructureSizes(obj_handle_t device, struct WMTAccelerationStructureInfo *info);
 
@@ -2620,6 +2678,8 @@ enum { WMTUnixSampledEncoder = 167, WMTUnixDiagWrite, WMTUnixDispatchDataBytes, 
        WMTUnixComputeStaticThreadgroupMemory, WMTUnixDeviceMaxThreadgroupMemory,
        WMTUnixDeviceMaxThreadsPerThreadgroup, WMTUnixDeviceReport, WMTUnixTextureSparseTailHolds,
        WMTUnixDeviceSparseResidencyInTiles, WMTUnixDeviceNewSpecializedRenderPipeline,
+       WMTUnixDeviceSupportsFXFrameInterpolator, WMTUnixDeviceNewFrameInterpolator,
+       WMTUnixCommandBufferEncodeFrameInterpolation,
        WMTUnixCallCount };
 WINEMETAL_API obj_handle_t MTLCommandBuffer_sampledCommandEncoder(obj_handle_t cmdbuf, enum WMTSampledEncoder type,
                                                                   const struct WMTSampleBufferAttachmentInfo *samples,

@@ -17,7 +17,7 @@ main(int argc, char **argv) {
   std::mt19937 random(seed);
   auto watchdog = CreateThread(
       nullptr, 0,
-      [](void *) -> DWORD {
+      [](void *) WINAPI -> DWORD {
         Sleep(550000);
         printf("failed: clear rectangle test exceeded its deadline\n");
         ExitProcess(1);
@@ -28,7 +28,7 @@ main(int argc, char **argv) {
     return verdict();
   CloseHandle(watchdog);
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   ComPtr<ID3D12CommandQueue> queue;
   ComPtr<ID3D12CommandAllocator> allocator;
   ComPtr<ID3D12GraphicsCommandList> list;

@@ -218,3 +218,55 @@ show that rendering was correct. Neither shows the commands that drew a frame.
 The reduction becomes a test written as [TESTING.md 5](TESTING.md#5-writing-a-test) describes, seen failing before
 the fix: it is registered in its directory's `meson.build`, and its control is a fault in `tests/breaks` that
 `tests/faults.py` shows caught ([TESTING.md 7.1](TESTING.md#7-failing-controls-and-repeats)).
+## 10. Behaviour switches in the environment
+
+Nineteen names the code reads from the environment appeared in no document -- several explained only in a comment at
+their own call site, which is no help to someone choosing what to set. Each row below was read at that call site, and
+the file is named so the description can be checked rather than trusted. They are here because a switch nobody can
+find is a switch nobody can use to answer a question, and because three of them -- `MULLION_D3D12_METAL4`,
+`MULLION_ENABLE_NVEXT`, `MULLION_D3D12_PARALLEL_COMMANDS` -- are what the test suite itself sets, so a contributor
+reading a failing test meets them there first.
+
+**Taking a Metal frame capture.** All six are described in [section 5](#5-capture-a-metal-frame) as well; listed here
+so they are findable from a name rather than only from a procedure.
+
+| name | what it does | unset |
+|---|---|---|
+| `MTL_CAPTURE_ENABLED` | `1` is what Metal itself requires before any GPU capture is possible (`mullion_capture.cpp:31`) | no capture is attempted |
+| `MULLION_CAPTURE_EXECUTABLE` | the process name a capture applies to: capture is off unless this matches the running executable's base name (`:32`) | off |
+| `MULLION_CAPTURE_FRAME` | which frame to capture (`:61`) | none scheduled |
+| `MULLION_CAPTURE_FRAMES` | how many frames a capture holds; a trigger file may carry the number instead (`:55`) | 1 |
+| `MULLION_CAPTURE_PATH` | where the `.gputrace` goes; a trace is large, so failing this the log directory is used when `MULLION_LOG_PATH` names one, and never the executable's own directory (`:208`) | the log directory |
+| `MULLION_CAPTURE_TRIGGER` | a file whose appearance starts the capture and which is then deleted, so a capture can begin from outside the game (`:65`) | no external trigger |
+
+**Direct3D 12 command processing.**
+
+| name | what it does | default |
+|---|---|---|
+| `MULLION_D3D12_METAL4` | `0` keeps Direct3D 12 on the Metal 3 bridge paths; anything else uses Metal 4 where macOS offers it. This is what a `-metal3` family in `tests/run.py` sets (`d3d12_device.hpp:871`) | Metal 4 where available |
+| `MULLION_D3D12_PARALLEL_COMMANDS` | how many threads may encode one submission's independent pass runs at once; `1` encodes on the queue's own thread, which is what the tests use to make ordering observable (`d3d12_command_queue.cpp:377`) | sized by the machine |
+| `MULLION_D3D12_THREADS_AT_ONCE` | the same limit given directly, for a test or to see what a part's size does | derived |
+| `MULLION_D3D12_ENCODE_THREADS` | `1` encodes a frame on one thread (`d3d12_command_queue.cpp`, the comment above the two above) | parallel |
+| `MULLION_D3D12_GPU_WAITS` | `1` lets a queue wait for another's completion event on the GPU. Off because that stalled ~4 s in one title and, past Metal's limit of five waits, silently dropped about a frame in fifty (`d3d12_command_queue.cpp`) | CPU waits |
+| `MULLION_D3D12_METAL3_EVENT_WAIT` | on the Metal 3 path, wait by shared event rather than by command-buffer completion; a wrong prediction of which buffer a `Signal` follows costs time, not order (`d3d12_command_queue.cpp:107`) | on, Metal 3 only |
+| `MULLION_D3D12_ALIASES_INSIDE` | `0` orders aliased resources with a barrier against all of the queue's preceding work instead of inside the next encoder (`d3d12_command_queue.cpp`, `MTL4CommandBuffer_orderAliases`) | inside |
+| `MULLION_D3D12_HOIST_COPIES` | `0` stops BC4/BC5 SNORM companion decoding from being hoisted to the start of the render pass that reads it, after the last copy wrote (`d3d12_command_list.cpp:336`) | hoisted |
+| `MULLION_D3D12_DEFER_PIPELINES` | `0` builds the Metal pipeline on the calling thread; `draw` waits until a draw needs it; any other value defers as broadly as the type allows (`d3d12_deferred_pipeline.hpp:64,71`) | deferred |
+| `MULLION_D3D11_FAULT_DEVICE` | fails the nth map of a staging buffer, so a device can be lost at a chosen point in a frame (`1` is the first; a larger number leaves later maps whole) (`d3d11_device.cpp`) | nothing faulted |
+
+**Rasterization and shader paths.**
+
+| name | what it does | default |
+|---|---|---|
+| `MULLION_D3D12_PIXEL_CULL` | `all` culls in the pixel shader wherever that is possible, `0` never; otherwise only where the pixel shader cannot already be doing the culling -- not where it may discard, writes depth, or uses UAVs (`d3d12_pipeline_graphics.cpp`) | heuristic |
+| `MULLION_D3D12_CULL_MESH_ONLY` | `0` keeps the object stage everywhere. Otherwise a triangle list whose vertex shader only passes cull distances through runs the vertex shader alone, which costs about what the triangles do (`d3d12_pipeline_graphics.cpp:1892`); strips, stream output, conservative rasterization, quadrilateral lines and geometry shaders keep the object stage regardless | mesh-only lists |
+| `MULLION_D3D12_FAST_MESH` | `0` keeps the copy `DispatchMesh` made, for A/B runs against airconv's in-place payload build; the flag is part of the shader cache's key (`d3d12_pipeline_graphics.cpp`) | in place |
+| `MULLION_D3D12_FAST_STREAM_OUTPUT` | `0` stops stream output running in the single pass that relies on each object threadgroup's primitives following from its place (`d3d12_pipeline_graphics.cpp`) | one pass |
+| `MULLION_D3D12_SPECIALIZED_RAYS` | `0` makes pipelines call every shader through the function table, which is slower but traceable and lets the pipeline say what shader kinds it has (`d3d12_device.cpp`) | specialized |
+| `MULLION_D3D12_FLEXIBLE` | `1` asks for Metal 4 pipeline specialization -- off by default because on macOS 27.3 a specialization leaves the fragment stage without a primitive id, and several tests fail through it (`d3d12_device.cpp`) | off |
+| `MULLION_MAX_MESH_THREADGROUPS` | mesh threadgroups per draw, each holding 2 KB: sets the payload-and-geometry cap per draw; unset takes the family's published limit, 4 GB on Apple7 and Apple8, which 2^21 groups fill (`mullion_info.cpp:99`) | per family |
+| `MULLION_ENABLE_NVEXT` | `1` turns the NGX bridge on, `0` off; with neither, it follows the configuration: a program whose section reports an NVIDIA vendor id (`dxgi.customVendorId = 10de`) gets it. A launcher that rewrites the environment leaves that per-program section alone (`dxgi.cpp:45`) | by configuration |
+
+`MULLION_AIRCONV_SKIP` and `MULLION_AIRCONV_HOIST_LOADS` are converter switches, described in
+[section 6](#6-inspect-shader-conversion-and-caches) with the shaders they affect; `DXMT_` spellings of some names are
+read as fallbacks from the project's earlier name.

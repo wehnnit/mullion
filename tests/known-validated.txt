@@ -1,0 +1,15 @@
+# every failure and skip that is known under Metal's API and shader validation (--validate), by what the test said,
+# with its cause. a line here is '<family>[/<arch>] <test> <verdict or skip> -- <cause>', as in known.txt; a test that
+# fails only under validation belongs here and not there, and a line without a cause does not belong anywhere.
+#
+# --validate compares against this file and refuses to run without it (tests/run.py, listed_by): a validated gate that
+# reports "0 known" against a list that does not exist cannot tell a fixed failure from a missing list.
+#
+# made from a reviewed run, not by absorbing a count:
+#   PE64  .agent-obj/logs/gate-pe64-d3d9-validated.log   manifest e01079eece5fb36f  37 passed, 0 failed, 0 skipped
+#         build64-2311 (d3d9.dll 269a818d145bf5e6), llvm-mingw 20261104, wine-8.17, Metal API + GPU validation enabled
+#   PE32  .agent-obj/logs/gate-pe32-d3d9-validated.log   manifest 8706c90e17871523  37 passed, 0 failed, 0 skipped
+#         build32-2311 (d3d9.dll e9d304fe77194c37), llvm-mingw 20261104, wine-8.17, Metal API + GPU validation enabled
+#
+# both runs of the reviewed artifact record no failure and no skip, so this list holds none: the D3D9 gate under
+# validation is green on both ABIs, and every entry added here from now on needs the cause its run found.

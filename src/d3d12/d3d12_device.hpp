@@ -188,6 +188,10 @@ WithoutMipRegion(const D3D12_RESOURCE_DESC1 &desc1) {
           desc1.MipLevels, desc1.Format,    desc1.SampleDesc, desc1.Layout, desc1.Flags};
 }
 
+class MTLD3D12Resource;
+
+Texture *BcSnormCompanionOf(MTLD3D12Resource *resource);
+
 class MTLD3D12Resource : public ID3D12Resource2 {
 public:
   virtual void AddRefPrivate() = 0;
@@ -497,6 +501,9 @@ public:
   D3D12_QUERY_HEAP_DESC desc;
   // occlusion results, one 64-bit value per query, stream output statistics (two) or pipeline statistics
   WMT::Reference<WMT::Buffer> results;
+#ifdef __i386__
+  std::shared_ptr<void> results_host_;
+#endif
   uint64_t results_address = 0;
   uint32_t result_size = sizeof(uint64_t);
   // a timestamp heap's queries: the clock each sampled, which the queue reads from its counter sample buffers when
@@ -583,6 +590,9 @@ public:
   bool so_single = false, so_single_strip = false, rasterless = false;
   // the geometry shader's instances, 1 without one
   uint32_t gs_instances = 1;
+  // a tessellation pipeline's stream output: the most workloads of a patch group, and the counts a patch group keeps
+  // of its primitives (tessellation_stream_output_counts)
+  uint32_t so_workloads = 0, so_counts = 0;
   // the mesh threadgroups an object threadgroup starts for each primitive: the geometry shader's instances, 1 when
   // the mesh stage only passes primitives on, 0 when it starts none (stream output alone)
   uint32_t mesh_instances = 0;
@@ -1005,6 +1015,19 @@ struct D3D12SwapChainBufferRefs {
   mullion::mutex mutex;
 };
 
+// the formats a texture may be viewed as besides its own, which CreateCommittedResource3 and its kin are given. the
+// texture takes them from the thread that creates it, through the creation calls between; a list is held for one
+// creation at a time
+class CastableFormats {
+  bool held_;
+
+public:
+  CastableFormats(UINT Count, const DXGI_FORMAT *pFormats);
+  ~CastableFormats();
+  CastableFormats(const CastableFormats &) = delete;
+  static std::span<const DXGI_FORMAT> Current();
+};
+
 // pTexture: the texture it is, which another module made
 HRESULT CreateCommittedTexture(
     MTLD3D12Device *pDevice, const D3D12_HEAP_PROPERTIES *pHeapProps, D3D12_HEAP_FLAGS HeapFlags,
@@ -1102,19 +1125,14 @@ GetRenderTargetHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Handle)
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12RenderTargetDescriptorHeap>(), (UINT)impl.Descriptor};
 #else
-  IMPLEMENT_ME
-  return {};
+  EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
+    return {impl.extract<MTLD3D12RenderTargetDescriptorHeap>(), (UINT)impl.Descriptor};
 #endif
 }
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetRenderTargetDescriptor(MTLD3D12RenderTargetDescriptorHeap *pHeap, UINT Index) {
-#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
-#else
-  IMPLEMENT_ME
-  return {};
-#endif
 }
 
 inline std::tuple<MTLD3D12DescriptorHeap *, UINT>
@@ -1123,20 +1141,14 @@ GetShaderVisibleDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HAN
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12DescriptorHeap>(), (UINT)impl.Descriptor};
 #else
-  IMPLEMENT_ME
-  return {};
+  EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
+    return {impl.extract<MTLD3D12DescriptorHeap>(), (UINT)impl.Descriptor};
 #endif
 }
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetShaderVisibleDescriptor(MTLD3D12DescriptorHeap *pHeap, UINT Index) {
-#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
-#else
-  IMPLEMENT_ME
-  return {};
-#endif
-  //
 }
 
 inline std::tuple<MTLD3D12SamplerDescriptorHeap *, UINT>
@@ -1145,19 +1157,14 @@ GetSamplerDescriptorHeap(MTLD3D12Device *pDevice, D3D12_CPU_DESCRIPTOR_HANDLE Ha
   EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
   return {impl.extract<MTLD3D12SamplerDescriptorHeap>(), (UINT)impl.Descriptor};
 #else
-  IMPLEMENT_ME
-  return {};
+  EMBEDDED_DESCRIPTOR_HANDLE impl(Handle);
+    return {impl.extract<MTLD3D12SamplerDescriptorHeap>(), (UINT)impl.Descriptor};
 #endif
 }
 
 inline D3D12_CPU_DESCRIPTOR_HANDLE
 GetSamplerDescriptor(MTLD3D12SamplerDescriptorHeap *pHeap, UINT Index) {
-#ifdef MULLION_USE_EMBEDDED_HEAP_POINTER
   return EMBEDDED_DESCRIPTOR_HANDLE(pHeap, Index);
-#else
-  IMPLEMENT_ME
-  return {};
-#endif
 }
 
 template <typename VIEW_DESC>

@@ -1524,6 +1524,18 @@ public:
     return MTLDevice_supportsFXDenoisedScaler(handle, metal4);
   }
 
+  bool
+  supportsFXFrameInterpolator(bool metal4) {
+    return MTLDevice_supportsFXFrameInterpolator(handle, metal4);
+  }
+
+  // the answer is an Objective-C object the caller releases with NSObject_release, as FXDenoisedScaler does through
+  // Reference<>; a plain handle keeps this test from having to declare a class for an object it only constructs
+  obj_handle_t
+  newFrameInterpolator(const WMTFXFrameInterpolatorInfo &info, bool metal4) {
+    return MTLDevice_newFrameInterpolator(handle, &info, metal4);
+  }
+
   void
   setShouldMaximizeConcurrentCompilation(bool value) {
     MTLDevice_setShouldMaximizeConcurrentCompilation(handle, value);

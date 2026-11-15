@@ -20,6 +20,7 @@
 #include "mullion_diag.hpp"
 #include "airconv_ray.h"
 #include "d3d12_device.hpp"
+#include "wsi_platform.hpp"
 #include "d3d12_device_child.hpp"
 #include "d3d12_pipeline.hpp"
 #include "Metal.hpp"
@@ -252,6 +253,11 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   uint32_t *atomic_locks_given_up_ = nullptr;
   WMT::Reference<WMT::Buffer> null_buffer_;
   uint64_t null_buffer_address_ = 0;
+#ifdef __i386__
+  /* Metal maps a buffer it allocated itself above 4 GB, which a 32-bit process cannot touch: the
+   * buffers the CPU reads or writes carry memory this side allocated, which Metal maps where it is. */
+  std::shared_ptr<void> atomic_locks_host_, null_buffer_host_;
+#endif
   WMTSparsePageSize sparse_page_size_ = {};
 
   Com<IMTLDXGIAdapter> adapter_;
@@ -271,6 +277,9 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, ID3DD
   // compacted sizes are uint64s of shared buffers the GPU writes
   std::vector<WMT::Reference<WMT::Buffer>> compacted_size_buffers_;
   std::vector<CompactedSize> free_compacted_sizes_;
+#ifdef __i386__
+  std::vector<std::shared_ptr<void>> compacted_size_hosts_;
+#endif
   // ray tracing shaders' table slots: the ones freed, and the next new one
   std::vector<uint32_t> free_ray_functions_;
   uint32_t next_ray_function_ = SM50_RAY_FUNCTION_FIRST_SHADER;
@@ -420,6 +429,12 @@ public:
     WMTBufferInfo locks_info{
         sizeof(AccelerationStructureHeader) + sizeof(uint32_t) * (locks + 2), WMTResourceStorageModeShared
     };
+#ifdef __i386__
+    atomic_locks_host_ = std::shared_ptr<void>(wsi::aligned_malloc(locks_info.length, MULLION_PAGE_SIZE), wsi::aligned_free);
+    if (!atomic_locks_host_)
+      return FAIL(E_OUTOFMEMORY);
+    locks_info.memory.set(atomic_locks_host_.get());
+#endif
     atomic_locks_ = GetMTLDevice().newBuffer(locks_info);
     if (!atomic_locks_) {
       ERR("Failed to create the lock table of 64-bit atomics");
@@ -434,6 +449,12 @@ public:
     atomic_locks_address_ = locks_info.gpu_address + sizeof(AccelerationStructureHeader);
     RegisterResidency(atomic_locks_);
     WMTBufferInfo null_info{D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 4 * sizeof(uint32_t), WMTResourceStorageModeShared};
+#ifdef __i386__
+    null_buffer_host_ = std::shared_ptr<void>(wsi::aligned_malloc(null_info.length, MULLION_PAGE_SIZE), wsi::aligned_free);
+    if (!null_buffer_host_)
+      return FAIL(E_OUTOFMEMORY);
+    null_info.memory.set(null_buffer_host_.get());
+#endif
     if (!(null_buffer_ = GetMTLDevice().newBuffer(null_info))) {
       ERR("Failed to create the target of null buffer views");
       return E_FAIL;
@@ -1005,7 +1026,8 @@ public:
       if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS12))
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS12 *>(pFeatureData);
-      out->RelaxedFormatCastingSupported = FALSE;
+      // a texture made with a format list has views in the formats of it (CreateCommittedResource3)
+      out->RelaxedFormatCastingSupported = TRUE;
       // ID3D12Device10's layouts and ID3D12GraphicsCommandList7::Barrier
       out->EnhancedBarriersSupported = TRUE;
       out->MSPrimitivesPipelineStatisticIncludesCulledPrimitives = D3D12_TRI_STATE_FALSE;
@@ -1200,6 +1222,15 @@ public:
         return FAIL(E_INVALIDARG);
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS14 *>(pFeatureData);
       out->IndependentFrontAndBackStencilRefMaskSupported = TRUE;
+      // SampleCmpLevel, GatherRaw and programmable offsets are lowered by the DXIL converter (SM 6.7, Advanced Texture
+      // Ops)
+      out->AdvancedTextureOpsSupported = TRUE;
+      // writable MSAA textures (RWTexture2DMS) have no Metal shader to write them: MSL's texture2d_ms takes only
+      // access::read (the Metal toolchain's metal_texture2d_ms refuses write and read_write under every language
+      // version, metal3.0 to metal4.0), and an air.write_texture_2d_ms call, which the front end never emits, leaves
+      // the GPU compiler's pipeline with an undefined llvm.agx.smpw.2d.msaa symbol (checked on an Apple M4 Pro). a
+      // pipeline whose shader declares one is refused (ShaderFeaturesSupported)
+      out->WriteableMSAATexturesSupported = FALSE;
       return S_OK;
     }
     /* capabilities with no complete path yet: D3D12 defines an all-zero answer as unsupported, or tier 0, in each */
@@ -1882,6 +1913,12 @@ public:
           if (PlaneBytesPerTexel[0] == 0)
             break;
         }
+        // a decoded BC SNORM storage holds float texels, but a footprint is the raw blocks' layout, which
+        // the copies into and out of the resource decode from or encode to (D3D11.3 19.4.2's block shapes)
+        if (FormatDesc.Flag & MTL_DXGI_FORMAT_BC_SNORM_DECODED) {
+          BlockWidth = 4;
+          PlaneBytesPerTexel[0] = FormatDesc.PixelFormat == WMTPixelFormatRG32Float ? 16 : 8;
+        }
       }
 
       if (pDesc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
@@ -2379,8 +2416,14 @@ public:
     });
   }
 
-  /* ID3D12Device10: resources start in a barrier layout instead of a state. format lists require
-     RelaxedFormatCastingSupported (VulkanOn12, "Format List Casting") */
+  /* ID3D12Device10: resources start in a barrier layout instead of a state. a texture's format list names the formats
+     its views may have besides its own (RelaxedFormatCastingSupported, VulkanOn12 "Format List Casting"); a buffer
+     has none */
+  static bool
+  FormatListFits(UINT Count, const DXGI_FORMAT *pFormats, D3D12_RESOURCE_DIMENSION Dimension) {
+    return !Count || (pFormats && Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+  }
+
   static D3D12_RESOURCE_STATES
   LayoutState(D3D12_BARRIER_LAYOUT Layout) {
     return Layout == D3D12_BARRIER_LAYOUT_RENDER_TARGET ? D3D12_RESOURCE_STATE_RENDER_TARGET
@@ -2395,8 +2438,9 @@ public:
       void **ppResource
   ) {
     InitReturnPtr(ppResource);
-    if (NumCastableFormats)
+    if (!pDesc || !FormatListFits(NumCastableFormats, pCastableFormats, pDesc->Dimension))
       return FAIL(E_INVALIDARG);
+    CastableFormats castable(NumCastableFormats, pCastableFormats);
     return CreateCommittedResource2(
         pHeapProps, HeapFlags, pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource
     );
@@ -2409,8 +2453,9 @@ public:
       REFIID riid, void **ppResource
   ) {
     InitReturnPtr(ppResource);
-    if (NumCastableFormats)
+    if (!pDesc || !FormatListFits(NumCastableFormats, pCastableFormats, pDesc->Dimension))
       return FAIL(E_INVALIDARG);
+    CastableFormats castable(NumCastableFormats, pCastableFormats);
     return CreatePlacedResource1(
         pHeap, HeapOffset, pDesc, LayoutState(InitialLayout), OptimizedClearValue, riid, ppResource
     );
@@ -2423,8 +2468,9 @@ public:
       void **ppResource
   ) {
     InitReturnPtr(ppResource);
-    if (NumCastableFormats)
+    if (!pDesc || !FormatListFits(NumCastableFormats, pCastableFormats, pDesc->Dimension))
       return FAIL(E_INVALIDARG);
+    CastableFormats castable(NumCastableFormats, pCastableFormats);
     return CreateReservedResource1(pDesc, LayoutState(InitialLayout), OptimizedClearValue, pSession, riid, ppResource);
   }
 
@@ -2773,6 +2819,12 @@ public:
       // a block of them, to not pay a page for each
       constexpr uint64_t block = 1 << 16;
       WMTBufferInfo info{block, WMTResourceStorageModeShared};
+#ifdef __i386__
+      compacted_size_hosts_.push_back(std::shared_ptr<void>(wsi::aligned_malloc(info.length, MULLION_PAGE_SIZE), wsi::aligned_free));
+      if (!compacted_size_hosts_.back())
+        return void(FAIL(E_OUTOFMEMORY));
+      info.memory.set(compacted_size_hosts_.back().get());
+#endif
       auto &buffer = compacted_size_buffers_.emplace_back(GetMTLDevice().newBuffer(info));
       for (uint64_t offset = 0; offset < info.length; offset += sizeof(uint64_t))
         free_compacted_sizes_.push_back({buffer.handle, offset, (uint64_t *)((char *)info.memory.ptr + offset)});

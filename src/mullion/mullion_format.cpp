@@ -1024,7 +1024,9 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     break;
   }
   case DXGI_FORMAT_BC4_SNORM: {
-    description.PixelFormat = WMTPixelFormatBC4_RSnorm;
+    // the storage is the raw blocks, which every copy and lock speaks; the SNORM view's exact decode is
+    // the companion texture the view's creation makes and fills (the same companion the D3D11 layer keeps)
+    description.PixelFormat = WMTPixelFormatBC4_RUnorm;
     description.Flag = MTL_DXGI_FORMAT_BC;
     description.BlockSize = 8;
     break;
@@ -1042,7 +1044,7 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     break;
   }
   case DXGI_FORMAT_BC5_SNORM: {
-    description.PixelFormat = WMTPixelFormatBC5_RGSnorm;
+    description.PixelFormat = WMTPixelFormatBC5_RGUnorm;
     description.Flag = MTL_DXGI_FORMAT_BC;
     description.BlockSize = 16;
     break;
@@ -1852,11 +1854,15 @@ MTLQueryDXGIFormatSupport(
   // D3D11.3 19.1.4: shaders read the shared-exponent format and nothing renders to it, though Metal can
   if (Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP)
     Capability = Capability & FormatCapability::Filter;
+  // a decoded BC SNORM format's Metal storage is float texels, whose capability would answer what a
+  // block-compressed format may not: shaders sample and load it, and nothing renders to it or stores it
+  if (metal_format.Flag & MTL_DXGI_FORMAT_BC_SNORM_DECODED)
+    Capability = Capability & (FormatCapability::Filter | FormatCapability::Sparse);
   // the same table gives a depth stencil format, its planes and their parent no 3D texture, and a block compressed
   // format no 1D texture
   if (any_bit_set(Capability & FormatCapability::DepthStencil))
     Support1 &= ~D3D11_FORMAT_SUPPORT_TEXTURE3D;
-  if (metal_format.Flag & MTL_DXGI_FORMAT_BC)
+  if (metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_BC_SNORM_DECODED))
     Support1 &= ~D3D11_FORMAT_SUPPORT_TEXTURE1D;
 
   // integer formats have shader loads, not shader samples (D3D11.3 19.1.4)

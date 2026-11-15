@@ -68,12 +68,12 @@ main(int argc, char **argv) {
     return 1;
   }
   ComPtr<ID3D12Device2> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
-  step("OPTIONS14 promises independent references and masks, with no unrelated features");
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  step("OPTIONS14 promises independent references and masks and advanced texture operations, not writable MSAA");
   D3D12_FEATURE_DATA_D3D12_OPTIONS14 options{TRUE, TRUE, FALSE};
   HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &options, sizeof(options));
   expect(hr == S_OK && options.IndependentFrontAndBackStencilRefMaskSupported &&
-             !options.AdvancedTextureOpsSupported && !options.WriteableMSAATexturesSupported,
+             options.AdvancedTextureOpsSupported && !options.WriteableMSAATexturesSupported,
          "OPTIONS14 returned %#lx, advanced %d, MSAA %d, independent %d", hr, options.AdvancedTextureOpsSupported,
          options.WriteableMSAATexturesSupported, options.IndependentFrontAndBackStencilRefMaskSupported);
   for (UINT size : {UINT(sizeof(options) - 1), UINT(sizeof(options) + 1)})

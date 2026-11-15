@@ -32,7 +32,7 @@ float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
 static int
 run(const std::string &cs, const std::string &vs, const std::string &ps, UINT queries, UINT heaps) {
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_ROOT_PARAMETER parameters[3] = {
       {D3D12_ROOT_PARAMETER_TYPE_UAV}, {D3D12_ROOT_PARAMETER_TYPE_UAV}, {D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS}
   };
@@ -304,6 +304,10 @@ main(int argc, char **argv) {
     GetExitCodeProcess(process.hProcess, &result);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
+    if (waited == WAIT_OBJECT_0 && result == 77) {
+      printf("skipped: the child could not make its Direct3D 12 device\n");
+      return verdict_skipped("the child could not make its Direct3D 12 device");
+    }
     expect(waited == WAIT_OBJECT_0 && result == 0, "child result %lu, wait %lu", result, waited);
     unsigned render = 0, compute = 0, blit = 0, traced = 0;
     for (auto &entry : std::filesystem::directory_iterator(directory)) {

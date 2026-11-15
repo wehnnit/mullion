@@ -159,4 +159,25 @@ extern "C" HRESULT __stdcall DXGIDeclareAdapterRemovalSupport() {
   return S_OK;
 }
 
+// the hooks a Direct3D 10/11 runtime layers its device on (Wine's d3d11 calls them; Mullion's d3d10core and d3d11 do
+// not). no runtime's device is made here, so each refuses. Wine's DXGID3D10CreateDevice has seven arguments and
+// Windows' six (dxgi.lib: _DXGID3D10CreateDevice@24), so no argument is written through.
+extern "C" HRESULT __stdcall DXGID3D10CreateDevice(HMODULE, IDXGIFactory *, IDXGIAdapter *, UINT,
+                                                   const D3D_FEATURE_LEVEL *, UINT, void **) {
+  Logger::warn("DXGID3D10CreateDevice: not a Direct3D 10 runtime's DXGI");
+  return E_NOTIMPL;
+}
+
+extern "C" HRESULT __stdcall DXGID3D10CreateLayeredDevice(void *, UINT, void *, void *, void *) {
+  return E_NOTIMPL;
+}
+
+extern "C" SIZE_T __stdcall DXGID3D10GetLayeredDeviceSize(const void *, UINT) {
+  return 0;
+}
+
+extern "C" HRESULT __stdcall DXGID3D10RegisterLayers(const void *, UINT) {
+  return E_NOTIMPL;
+}
+
 } // namespace mullion

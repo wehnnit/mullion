@@ -21,6 +21,14 @@ struct RGB32CopyLayout {
   sm50_sparse_qword src_row, src_image, dst_row, dst_image;
 };
 
+// a BC4/BC5 SNORM footprint's rows and the decoded texture's rows, and the copy's width in texels,
+// which the kernel's grid matches, and whether the blocks carry two channels (BC5_SNORM)
+struct BCSnormDecodeLayout {
+  sm50_sparse_qword src_row, src_image, dst_row, dst_image;
+  uint32_t width;
+  uint32_t rg;
+};
+
 struct SparseTexelClear {
   sm50_sparse_qword byte_offset;
   sm50_sparse_qword texel_size;

@@ -24,6 +24,41 @@ using namespace mullion::air;
 using namespace mullion::shader::common;
 
 namespace mullion::dxbc {
+static llvm::Value *
+d24_code(llvm::IRBuilder<> &ir, llvm::Value *z) {
+  auto zero = llvm::ConstantFP::get(z->getType(), 0.0);
+  auto one = llvm::ConstantFP::get(z->getType(), 1.0);
+  auto bits = ir.CreateBitCast(z, ir.getInt32Ty());
+  auto biased = ir.CreateAnd(ir.CreateLShr(bits, ir.getInt32(23)), ir.getInt32(255));
+  auto exp = ir.CreateSub(biased, ir.getInt32(127));
+  auto mant = ir.CreateZExt(ir.CreateOr(ir.CreateAnd(bits, ir.getInt32(0x7fffff)), ir.getInt32(0x800000)), ir.getInt64Ty());
+  auto product = ir.CreateMul(mant, ir.getInt64(16777215));
+  auto raw_shift = ir.CreateSub(ir.getInt32(23), exp);
+  auto tiny = ir.CreateOr(ir.CreateICmpEQ(biased, ir.getInt32(0)), ir.CreateICmpSGT(raw_shift, ir.getInt32(62)));
+  auto shift = ir.CreateSelect(ir.CreateICmpSLT(raw_shift, ir.getInt32(1)), ir.getInt32(1), raw_shift);
+  shift = ir.CreateSelect(ir.CreateICmpSGT(shift, ir.getInt32(62)), ir.getInt32(62), shift);
+  auto wide = ir.CreateZExt(shift, ir.getInt64Ty());
+  auto half = ir.CreateShl(ir.getInt64(1), ir.CreateSub(wide, ir.getInt64(1)));
+  auto code = ir.CreateTrunc(ir.CreateLShr(ir.CreateAdd(product, half), wide), ir.getInt32Ty());
+  code = ir.CreateSelect(tiny, ir.getInt32(0), code);
+  code = ir.CreateSelect(ir.CreateFCmpUNO(z, z), ir.getInt32(0), code);
+  code = ir.CreateSelect(ir.CreateFCmpOLE(z, zero), ir.getInt32(0), code);
+  code = ir.CreateSelect(ir.CreateFCmpOGE(z, one), ir.getInt32(16777215), code);
+  return code;
+}
+llvm::Value *
+quantize_d24(llvm::IRBuilder<> &ir, llvm::Value *z) {
+  auto code = d24_code(ir, z);
+  auto stored = ir.CreateFDiv(ir.CreateUIToFP(code, z->getType()), llvm::ConstantFP::get(z->getType(), 16777215.0));
+  // dividing by float32(2^24-1) lands one ulp high for some codes, and the unorm pack then reads code + 1
+  auto back = d24_code(ir, stored);
+  // positive floats decrease toward zero as their bits do
+  auto nudged = ir.CreateBitCast(ir.CreateSub(ir.CreateBitCast(stored, ir.getInt32Ty()), ir.getInt32(1)), z->getType());
+  return ir.CreateSelect(ir.CreateICmpNE(back, code), nudged, stored);
+}
+} // namespace mullion::dxbc
+
+namespace mullion::dxbc {
 
 inline air::Interpolation
 to_air_interpolation(microsoft::D3D10_SB_INTERPOLATION_MODE mode) {
@@ -522,6 +557,10 @@ void handle_signature_ps(
       break;
     }
     signature_handlers.push_back([=](SignatureContext &ctx) {
+      if (siv == D3D10_SB_NAME_POSITION) {
+        ctx.position_reg = reg;
+        ctx.position_arg = assigned_index;
+      }
       ctx.prologue << init_input_reg(
         assigned_index, reg, mask, siv == D3D10_SB_NAME_POSITION, sample_index_at
       );
@@ -647,6 +686,7 @@ void handle_signature_ps(
           .arg_name = "depth_ranges",
         });
         auto viewport = ctx.func_signature.DefineInput(InputViewportArrayIndex{});
+        uint32_t unorm_bits = ctx.depth_unorm_bits;
         ctx.epilogue >> [=](pvalue v) {
           return make_irvalue([=](struct context ctx) {
             auto &ir = ctx.builder;
@@ -666,6 +706,9 @@ void handle_signature_ps(
             depth = ctx.air.CreateFPBinOp(
               AIRBuilder::fmin, range(1), ctx.air.CreateFPBinOp(AIRBuilder::fmax, range(0), depth, false), false
             );
+            // D24 is a float on this GPU. the test compares the value rounded to 24-bit unorm (D3D11.3 17.11)
+            if (unorm_bits == 24)
+              depth = quantize_d24(ir, depth);
             return ir.CreateInsertValue(v, depth, {assigned_index});
           });
         };

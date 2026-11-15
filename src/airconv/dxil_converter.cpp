@@ -225,6 +225,8 @@ enum Op : uint32_t {
   Pack4x8 = 220,
   IsHelperLane = 221,
   QuadVote = 222,
+  TextureGatherRaw = 223,
+  SampleCmpLevel = 224,
 };
 
 // DxilConstants.h SemanticKind values that have their own storage in the DXBC path, or in a Metal mesh
@@ -795,10 +797,12 @@ scaler_type(uint64_t component) {
   switch (component) {
   case 2:
   case 4:
-    return ScalerDataType::Int; // I16, I32
+  case 6:
+    return ScalerDataType::Int; // I16, I32, I64 (a raw gather's texels, read as two 32-bit channels)
   case 3:
   case 5:
-    return ScalerDataType::Uint; // U16, U32
+  case 7:
+    return ScalerDataType::Uint; // U16, U32, U64
   case 10:
     return ScalerDataType::Double;
   default:
@@ -882,7 +886,7 @@ if (auto resources = M.getNamedMetadata("dx.resources")) {
         // a resource consumed together with a sampler is sampled, or compared by a comparing operation, as DXBC's
         // sample_c marks it
         auto how = opcode(consumer);
-        bool compared = how == SampleCmp || how == SampleCmpLevelZero || how == TextureGatherCmp;
+        bool compared = how == SampleCmp || how == SampleCmpLevelZero || how == SampleCmpLevel || how == TextureGatherCmp;
         bool sampled = llvm::any_of(consumer->args(), [&](auto &arg) { return handle_of(arg, SamplerClass); });
         // feedback is written with atomics, which read
         // and an acceleration structure is read by the query or the ray it starts
@@ -1985,11 +1989,34 @@ convert_dxil(
       v = ir.CreateInsertElement(v, arg(call, first + i), i);
     return v;
   };
-  // `n` immediate offsets from `first`; missing ones are 0
-  auto offsets = [&](CallInst *call, unsigned first, unsigned n, int32_t out[3]) {
+  // `n` texel offsets from `first`; missing ones are 0. shader model 6.7 takes any value for an offset and honors its
+  // low 4 bits, as a signed one (HLSL_SM_6_7_Advanced_Texture_Ops, Programmable Offsets). a literal is Metal's
+  // immediate offset in `out`; where an offset is not one, `out` is all 0 and `dynamic` holds the n offsets as 32-bit
+  // signed integers
+  auto offsets = [&](CallInst *call, unsigned first, unsigned n, int32_t out[3], Value **dynamic = nullptr) {
+    constexpr unsigned bits = 4;
+    bool literal = true;
+    for (unsigned i = 0; i < 3; i++) {
+      out[i] = 0;
+      if (i < n && defined(arg(call, first + i))) {
+        auto constant = dyn_cast<ConstantInt>(arg(call, first + i));
+        literal &= constant != nullptr;
+        if (constant)
+          out[i] = int32_t(uint32_t(constant->getZExtValue()) << (32 - bits)) >> (32 - bits);
+      }
+    }
+    if (literal || !dynamic)
+      return;
+    Value *vector = Constant::getNullValue(air.getIntTy(n));
+    for (unsigned i = 0; i < n; i++) {
+      Value *v = ir.getInt32(out[i]);
+      if (defined(arg(call, first + i)) && !isa<ConstantInt>(arg(call, first + i)))
+        v = ir.CreateAShr(ir.CreateShl(arg(call, first + i), 32 - bits), 32 - bits);
+      vector = ir.CreateInsertElement(vector, v, i);
+    }
+    *dynamic = vector;
     for (unsigned i = 0; i < 3; i++)
-      out[i] =
-          i < n && defined(arg(call, first + i)) ? (int32_t)cast<ConstantInt>(arg(call, first + i))->getSExtValue() : 0;
+      out[i] = 0;
   };
   // the texel address operands from `first` (coordinates, then the array slice), with `w` last
   auto texel_coord = [&](CallInst *call, unsigned first, Value *w) {
@@ -2315,6 +2342,30 @@ convert_dxil(
     };
     auto lane = [&](uint16_t i) { return texels(move("quad_shuffle", coord, {ir.getInt16(i)})); };
     return gradient_lod(ir.CreateFSub(lane(1), lane(0)), ir.CreateFSub(lane(2), lane(0)));
+  };
+  // a sample's offsets that are not literals (`offsets`) move its coordinate instead, by as many texels as the mip it
+  // reads has: the nearest to `lod`, where a mip filter that blends two reads the offset exactly in the nearer one.
+  // `texels` holds an offset for each coordinate, and `coord` has as many as the texture's dimensions, or 2 of them
+  // for a 1D texture
+  auto offset_coord = [&](Handle &tex, Value *coord, Value *texels, unsigned logical, Value *lod) {
+    using llvm::air::AIRBuilder;
+    auto mips = air.CreateTextureQuery(tex.texture->Texture, tex.texture->Handle, Texture::num_mip_levels, ir.getInt32(0));
+    auto level = air.CreateConvertToUnsigned(
+        fp_unary(AIRBuilder::rint, air.CreateFPBinOp(AIRBuilder::fmax, lod, ConstantFP::get(ir.getFloatTy(), 0)))
+    );
+    level = air.CreateIntBinOp(AIRBuilder::min, level, ir.CreateSub(mips, ir.getInt32(1)), false);
+    auto size = dxbc.TextureDimensions(*tex.texture, level);
+    Value *moved = coord;
+    for (unsigned i = 0; i < logical; i++) {
+      auto step = ir.CreateFDiv(
+          air.CreateConvertToFloat(ir.CreateExtractElement(texels, i), Signedness::Signed),
+          air.CreateConvertToFloat(ir.CreateExtractElement(size, i), Signedness::Unsigned)
+      );
+      moved = coord->getType()->isVectorTy()
+                  ? ir.CreateInsertElement(moved, ir.CreateFAdd(ir.CreateExtractElement(moved, i), step), i)
+                  : ir.CreateFAdd(moved, step);
+    }
+    return moved;
   };
   auto lane_count = [&]() -> Value * {
     if (simd_inputs || !ctx.simd_width)
@@ -3140,23 +3191,73 @@ convert_dxil(
     case SampleLevel:
     case SampleGrad:
     case SampleCmp:
-    case SampleCmpLevelZero: {
+    case SampleCmpLevelZero:
+    case SampleCmpLevel: {
       auto &tex = handles[a(1)];
       auto &smp = handles[a(2)];
       auto [texture, coord, array, sampler, bias, logical, coord_ty] = sample(call, tex, smp, 3);
       int32_t offset[3];
-      offsets(call, 7, 3, offset);
+      Value *dynamic_offset = nullptr;
+      offsets(call, 7, 3, offset, &dynamic_offset);
       auto handle = tex.texture->Handle;
-      auto reference = op == SampleCmp || op == SampleCmpLevelZero ? dxbc.CompareReference(smp.sampler->Metadata, a(10)) : nullptr;
+      auto reference = op == SampleCmp || op == SampleCmpLevelZero || op == SampleCmpLevel
+                           ? dxbc.CompareReference(smp.sampler->Metadata, a(10))
+                           : nullptr;
       // compute shaders have no derivatives: they sample with their quads' gradients, or compare at their LOD
       bool compute = ctx.shader_type == D3D11_SB_COMPUTE_SHADER;
+      Value *unshifted = coord;
+      bool moved = dynamic_offset && !llvm::air::AIRBuilder::getTextureInfo(tex.texture->Logical).is_cube;
+      if (moved) {
+        // the LOD the sample reads at, which sets how large a texel its offset is
+        Value *lod;
+        switch (op) {
+        case SampleLevel:
+          lod = ir.CreateFAdd(a(10), bias);
+          break;
+        case SampleCmpLevel:
+          lod = ir.CreateFAdd(a(11), bias);
+          break;
+        case SampleCmpLevelZero:
+          lod = bias;
+          break;
+        case SampleGrad: {
+          auto dims = air.CreateConvertToFloat(
+              dxbc.TextureDimensions(*tex.texture, ir.getInt32(0)), Signedness::Unsigned
+          );
+          auto texels = [&](Value *gradient) -> Value * {
+            if (!gradient->getType()->isVectorTy())
+              return ir.CreateFMul(gradient, ir.CreateExtractElement(dims, (uint64_t)0));
+            SmallVector<int, 3> mask;
+            for (unsigned i = 0; i < count(gradient->getType()); i++)
+              mask.push_back(i);
+            return ir.CreateFMul(gradient, ir.CreateShuffleVector(dims, mask));
+          };
+          lod = ir.CreateFAdd(
+              gradient_lod(texels(vec(call, 10, logical, coord_ty)), texels(vec(call, 13, logical, coord_ty))), bias
+          );
+          break;
+        }
+        default: {
+          Value *implicit = compute ? quad_lod(*tex.texture, coord, false)
+                                    : air.CreateCalculateLOD(texture, handle, sampler, coord).second;
+          if (op == SampleBias)
+            implicit = ir.CreateFAdd(implicit, a(10));
+          lod = dxbc.CalculateLOD(*tex.texture, sampler, smp.sampler->Metadata, coord, implicit).first;
+          break;
+        }
+        }
+        coord = offset_coord(tex, coord, dynamic_offset, logical, lod);
+      }
       Value *residency_level = nullptr, *residency_bias = bias, *residency_clamp = nullptr;
       Value *residency_dx = nullptr, *residency_dy = nullptr;
       // how the sample takes its LOD, for a minimum or maximum filter; a comparison filter does not reduce
       std::optional<Converter::Footprint> footprint;
       std::function<std::pair<Value *, Value *>(Value *, Value *)> read;
-      if (compute && (op == Sample || op == SampleBias)) {
-        auto [dx, dy] = quad_gradients(coord);
+      // an offset that moved the coordinate leaves the derivatives where the unmoved one has them: a moved coordinate
+      // differs from its neighbors' by their offsets, which is no footprint
+      if ((compute || moved) && (op == Sample || op == SampleBias)) {
+        auto [dx, dy] = compute ? quad_gradients(unshifted)
+                                : std::pair{air.CreateDerivative(unshifted, false), air.CreateDerivative(unshifted, true)};
         if (op == SampleBias)
           bias = ir.CreateFAdd(a(10), bias);
         auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
@@ -3166,10 +3267,19 @@ convert_dxil(
         read = [&, gx, gy, clamp](Value *s, Value *) {
           return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset);
         };
+      } else if (moved && !compute && op == SampleCmp) {
+        auto dx = air.CreateDerivative(unshifted, false), dy = air.CreateDerivative(unshifted, true);
+        auto gx = dxbc.BiasGradient(dx, bias), gy = dxbc.BiasGradient(dy, bias);
+        auto clamp = min_lod(tex, a(11));
+        residency_dx = gx, residency_dy = gy, residency_clamp = clamp, residency_bias = nullptr;
+        read = [&, gx, gy, clamp](Value *s, Value *ref) {
+          return air.CreateSampleGrad(texture, handle, s, coord, array, gx, gy, clamp, offset, ref);
+        };
       } else if (compute && op == SampleCmp) {
         auto is_cube = llvm::air::AIRBuilder::getTextureInfo(tex.texture->Logical).is_cube;
         auto lod = llvm::air::sample_level{air.CreateFPBinOp(
-            llvm::air::AIRBuilder::fmax, min_lod(tex, a(11)), ir.CreateFAdd(quad_lod(*tex.texture, coord, is_cube), bias)
+            llvm::air::AIRBuilder::fmax, min_lod(tex, a(11)),
+            ir.CreateFAdd(quad_lod(*tex.texture, unshifted, is_cube), bias)
         )};
         residency_level = lod.lod;
         read = [&, lod](Value *s, Value *ref) {
@@ -3235,8 +3345,10 @@ convert_dxil(
           };
           break;
         }
+        case SampleCmpLevel:
         default: {
-          auto lod = llvm::air::sample_level{min_lod(tex, bias)};
+          // SampleCmpLevelZero's LOD is the sampler's bias alone, SampleCmpLevel's is its operand with the bias
+          auto lod = llvm::air::sample_level{min_lod(tex, op == SampleCmpLevel ? ir.CreateFAdd(a(11), bias) : bias)};
           residency_level = lod.lod;
           read = [&, lod](Value *s, Value *ref) {
             return ref ? air.CreateSampleCmp(texture, handle, s, coord, array, ref, offset, lod)
@@ -3277,11 +3389,18 @@ convert_dxil(
       if (element_bits(ty) > 32)
         return make_error<UnsupportedFeature>("DXIL 64-bit texture loads are not lowered yet");
       int32_t offset[3];
-      offsets(call, 6, 3, offset);
+      Value *dynamic_offset = nullptr;
+      offsets(call, 6, 3, offset, &dynamic_offset);
       bool ms = llvm::air::AIRBuilder::getTextureInfo(h.texture->Logical).is_ms;
-      auto [value, residency] = texel_read(
-          h, texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0)), offset, ms ? a(2) : nullptr, call
-      );
+      auto coord = texel_coord(call, 3, !ms && defined(a(2)) ? a(2) : ir.getInt32(0));
+      if (dynamic_offset) {
+        // a texel past the texture reads 0, as a literal offset's does
+        Value *moved = Constant::getNullValue(air.getIntTy(4));
+        for (unsigned i = 0; i < 3; i++)
+          moved = ir.CreateInsertElement(moved, ir.CreateExtractElement(dynamic_offset, i), i);
+        coord = ir.CreateAdd(coord, moved);
+      }
+      auto [value, residency] = texel_read(h, coord, offset, ms ? a(2) : nullptr, call);
       ret = to_struct(ty, value, residency);
       break;
     }
@@ -3411,6 +3530,33 @@ convert_dxil(
           *tex.texture, sampler, handles[a(2)].sampler->Metadata, coord, array, offset,
           op == TextureGather ? a(9) : nullptr, op == TextureGatherCmp ? a(10) : nullptr, handles[a(2)].sampler->Border
       );
+      ret = to_struct(ty, value, residency);
+      break;
+    }
+    case TextureGatherRaw: {
+      // the bits of four texels, with no conversion (HLSL_SM_6_7_Advanced_Texture_Ops, Raw Gather Methods): the view's
+      // format is an integer one, and Gather reads 16 and 32 bits from a channel of it. 64 bits are two channels, the
+      // low word's first
+      auto &tex = handles[a(1)];
+      auto &smp = handles[a(2)];
+      auto [texture, coord, array, sampler, bias, logical, coord_ty] = sample(call, tex, smp, 3);
+      Value *offset = Constant::getNullValue(air.getIntTy(logical));
+      for (unsigned i = 0; i < std::min(logical, 2u); i++)
+        if (defined(a(7 + i)))
+          offset = logical > 1 ? ir.CreateInsertElement(offset, a(7 + i), i) : a(7 + i);
+      auto gather = [&](unsigned channel) {
+        return dxbc.Gather(
+            *tex.texture, sampler, smp.sampler->Metadata, coord, array, offset, ir.getInt32(channel), nullptr,
+            smp.sampler->Border
+        );
+      };
+      auto [value, residency] = gather(0);
+      if (element_bits(ty) == 64) {
+        auto wide = FixedVectorType::get(ir.getInt64Ty(), 4);
+        value = ir.CreateOr(
+            ir.CreateZExt(value, wide), ir.CreateShl(ir.CreateZExt(gather(1).first, wide), ConstantInt::get(wide, 32))
+        );
+      }
       ret = to_struct(ty, value, residency);
       break;
     }

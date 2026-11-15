@@ -58,8 +58,19 @@ done
 # a prefix's system32 has the DLLs of Wine's own architecture, and its syswow64 the 32-bit ones a Wine that runs
 # 32-bit programs took above
 for prefix; do
-  cp "$here/$native"/*.dll "$prefix/drive_c/windows/system32/"
-  [ ! -d "$here/i386-windows" ] || [ ! -d "$wine/lib/wine/i386-windows" ] ||
-    [ ! -d "$prefix/drive_c/windows/syswow64" ] || cp "$here"/i386-windows/*.dll "$prefix/drive_c/windows/syswow64/"
+  windows="$prefix/drive_c/windows"
+  [ -d "$windows" ] || { echo "note: $prefix has no drive_c/windows; skipped" >&2; continue; }
+  # system32 gets the Wine's own architecture; syswow64 gets i386 when the prefix is WoW64. the i386 libraries go
+  # there only when this Wine has an i386 windows half of its own to load them with
+  cp "$here/$native"/*.dll "$windows/system32/"
+  if [ -d "$here/i386-windows" ] && [ -d "$windows/syswow64" ] && [ -d "$wine/lib/wine/i386-windows" ]; then
+    cp "$here/i386-windows"/*.dll "$windows/syswow64/"
+  elif [ -d "$here/i386-windows" ] && [ ! -d "$windows/syswow64" ]; then
+    # a 32-bit-only prefix: i386 libraries belong in its system32
+    if [ "$native" != "i386-windows" ] && [ "$native" != "x86-windows" ]; then
+      echo "note: $prefix is 32-bit; installing i386-windows into system32" >&2
+      cp "$here/i386-windows"/*.dll "$windows/system32/"
+    fi
+  fi
 done
 echo "Mullion is installed in $wine"

@@ -212,6 +212,8 @@ GetTexture(ID3D11Resource *pResource, UINT plane = 0) {
   auto texture = static_cast<D3D11ResourceCommon *>(pResource)->texture();
   return texture ? texture->plane(plane) : nullptr;
 }
+// a signed view of BC4/BC5 typeless blocks, decoded because the hardware is not exact at 0
+void RefreshBcSnormCompanion(Texture *texture, MTLD3D11Device *device);
 
 template <typename TEXTURE_DESC>
 void GetMipmapSize(const TEXTURE_DESC *pDesc, uint32_t level, uint32_t *pWidth,

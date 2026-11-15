@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""mullion-bundle: one command that gathers what a bug report needs, into one folder a person can attach.
+
+usage: tools/mullion-bundle.sh [BUNDLE] [--exe NAME] [--logs DIR] [--build DIR] [--prefix DIR] [--yes]
+
+Without arguments it reads the default trace folder, ~/Library/Logs/Mullion: each executable's mullion.log (and the
+previous launch's), its flight records, the router's record, and anything the diagnostics wrote where MULLION_DIAG_PATH
+pointed. --exe takes one executable's folder only. --build adds the run evidence that belongs to that build: the provenance manifest of each artifact the runner
+recorded, newest first (--attempts says how many; one an artifact is enough to say which build ran), as the runner
+wrote them under build/meson-logs/runs/<identity>/attempt-N. The per-test logs are not copied: they are the suite's
+own report, thousands of files, and they stay where they are. --prefix adds nothing from a prefix: a game's own files are
+not this bundle's business, and the Wine's version is read from the Wine the --build names.
+
+What is gathered is copied, never moved, and nothing outside BUNDLE is written. The bundle is a folder, not an archive,
+so opening it and reading the index is a step a person can do without another tool; a report attaches it as it is.
+
+The index names what was found and what was not. That matters more than the copies: a report that says "no log exists"
+is evidence (MULLION_LOG_PATH was not set, docs/DEBUGGING.md 2), and a bundle that only contains what happened to be
+there leaves the reader to guess whether the rest was missing or merely not copied.
+"""
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DEFAULT_LOGS = Path.home() / "Library" / "Logs" / "Mullion"
+# what "attachable" means: a folder a person can hand over, not a copy of the machine's log archive
+MAX_FILE = 8 * 1024 * 1024
+# overridable with --max-size, since a 12-second flight record of a crash is worth an awkward attachment
+
+
+def sh(*command):
+    """a command's first line, or what it said it could not do; a bundle never fails because a probe did"""
+    try:
+        out = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unavailable: {error}"
+    text = (out.stdout or out.stderr).strip().splitlines()
+    return text[0] if text else ("failed: " + out.stderr.strip()[:200] if out.returncode else "empty")
+
+
+def host(out):
+    """what ran this: the Mac, the system, and the Wine, none of which a reader can infer from a log"""
+    lines = [
+        f"made: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"host: {platform.mac_ver()[0]} on {platform.machine()} ({platform.processor()})",
+        f"model: {sh('sysctl', '-n', 'hw.model')}",
+        f"gpu: {gpu()}",
+        f"macOS build: {sh('sw_vers', '-buildVersion')}",
+    ]
+    return lines
+
+
+def wine_version(wine):
+    """the Wine's own version string, from the binary the build's tests ran with"""
+    binary = Path(wine) / "bin" / "wine" if wine else None
+    return sh(str(binary), "--version") if binary and binary.is_file() else "not named"
+
+
+def gpu():
+    """the GPU as a person names it, with the Metal feature set it belongs to"""
+    try:
+        out = subprocess.run(["system_profiler", "SPDisplaysDataType"], capture_output=True, text=True, timeout=60)
+        lines = out.stdout.splitlines()
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unavailable: {error}"
+    named = [line.split(":", 1)[1].strip() for line in lines if "Chipset Model" in line or "Vendor" not in line and "Metal Family" in line]
+    return ", ".join(named) or (lines[0].strip() if lines else "nothing reported")
+
+
+def too_big(path: Path, skipped: list, max_file: int) -> bool:
+    """whether a file is too big to ask a person to attach. A flight record of a long test run reaches hundreds of
+    megabytes (docs/DEBUGGING.md 7); a report needs the one that covers the crash, not the suite's leftovers, so a
+    file over the limit is named in the index with its size instead of copied and silently bloating the bundle."""
+    size = path.stat().st_size
+    if size <= max_file:
+        return False
+    skipped.append(f"{path} ({size / 1048576:.0f} MB)")
+    return True
+
+
+def gather_flights(logs: Path, into: Path, index, skipped, exe=None, max_file=MAX_FILE) -> int:
+    """the flight records, which sit beside the per-executable folder and are named after the executable"""
+    kept = 0
+    pattern = f"{exe}.flight" if exe else "*.flight"
+    for flight in sorted(logs.glob(pattern)):
+        if too_big(flight, skipped, max_file):
+            continue
+        into.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(flight, into / flight.name)
+        kept += 1
+    return kept
+
+
+def gather_exe(source: Path, into: Path, index, skipped=None, max_file=MAX_FILE):
+    """one executable's folder: the logs, the flight records and the router's record"""
+    kept = 0
+    for pattern in ("mullion.log", "mullion.prev.log", "*.log", "router.log", "router.json"):
+        for path in sorted(source.glob(pattern)):
+            if not path.is_file():
+                continue
+            if too_big(path, skipped, max_file):
+                continue
+            into.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, into / path.name)
+            kept += 1
+    if kept:
+        index.append(f"  {source.name}: {kept} file(s)")
+    return kept
+
+
+def gather_diag(directory: Path, into: Path, index):
+    """the profile records MULLION_DIAG_PATH names, which are read by tools/mullion-diag"""
+    if not directory.is_dir():
+        return 0
+    into.mkdir(parents=True, exist_ok=True)
+    kept = 0
+    for path in sorted(directory.glob("mullion-*.diag")):
+        shutil.copy2(path, into / path.name)
+        kept += 1
+    if kept:
+        index.append(f"  profile records: {kept} (read with tools/mullion-diag report {into})")
+    return kept
+
+
+def gather_runs(build: Path, into: Path, index, limit=8):
+    """the run evidence: the manifest of the last attempt of each artifact, newest first"""
+    runs = build / "meson-logs" / "runs"
+    if not runs.is_dir():
+        index.append(f"  runs: none in {runs}; the runner kept no attempt for this build")
+        return 0
+    into.mkdir(parents=True, exist_ok=True)
+    # one manifest an artifact: an earlier attempt of the same artifact is the suite's own history, and a report needs
+    # to know which build ran, not that it ran twice. The per-test logs are not copied for the same reason.
+    latest = {}
+    for identity in sorted(p for p in runs.iterdir() if p.is_dir()):
+        for attempt in sorted(p for p in identity.iterdir() if p.is_dir()):
+            manifest = attempt / "manifest.json"
+            if manifest.is_file():
+                current = latest.get(identity.name)
+                if current is None or manifest.stat().st_mtime >= current.stat().st_mtime:
+                    latest[identity.name] = manifest
+    kept = 0
+    for manifest in sorted(latest.values(), key=lambda path: path.stat().st_mtime)[-limit:]:
+        target = into / manifest.parent.parent.name / manifest.parent.name
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(manifest, target / "manifest.json")
+        kept += 1
+    summary = build / "meson-logs" / "testlog.json"
+    if summary.is_file():
+        shutil.copy2(summary, into / "testlog.json")
+        kept += 1
+    if kept:
+        index.append(f"  run evidence: {kept} file(s) -- the manifest of the last attempt of {len(latest)} artifact(s) "
+                     f"of this build, newest first, and the suite's summary; the per-test logs stay in {runs}")
+    return kept
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("bundle", nargs="?", default=None, help="where to write (default: ./mullion-bundle-<time>)")
+    parser.add_argument("--exe", help="one executable's name, e.g. Game.exe; default: every one there is")
+    parser.add_argument("--logs", type=Path, default=DEFAULT_LOGS, help="the trace folder (default: %(default)s)")
+    parser.add_argument("--diag", type=Path, help="a MULLION_DIAG_PATH folder of profile records")
+    parser.add_argument("--build", type=Path, help="the build directory whose run evidence belongs in the report")
+    parser.add_argument("--wine", help="the Wine installation the game ran under, for its version")
+    parser.add_argument("--max-size", type=int, default=MAX_FILE // 1024,
+                        help="the largest file to copy, in kilobytes (default: %(default)s)")
+    parser.add_argument("--attempts", type=int, default=8,
+                        help="how many attempt manifests to copy, newest first (default: %(default)s)")
+    parser.add_argument("--yes", action="store_true", help="write over an existing bundle instead of refusing")
+    args = parser.parse_args()
+
+    here = Path(args.bundle).resolve() if args.bundle else Path(f"mullion-bundle-{time.strftime('%Y%m%d-%H%M%S')}")
+    if here.exists() and any(here.iterdir()) and not args.yes:
+        sys.exit(f"{here}: not empty; pass --yes to write into it (nothing outside it is touched)")
+    here.mkdir(parents=True, exist_ok=True)
+
+    limit = args.max_size * 1024
+    index = [f"Mullion bug-report bundle", *host(here)]
+
+    logs = args.logs
+    if not logs.is_dir():
+        index.append(f"logs: {logs} does not exist, so nothing was ever written there. To get them, set "
+                     f"MULLION_LOG_PATH to a folder that exists and start the game again (docs/DEBUGGING.md 2); "
+                     f"without it the lines go to Wine's console only.")
+    else:
+        index.append(f"logs: {logs}")
+        found = 0
+        skipped: list = []
+        wanted = [logs / args.exe] if args.exe else sorted(p for p in logs.iterdir() if p.is_dir())
+        for source in wanted:
+            folder = source if source.is_dir() else source.parent
+            name = source.name if source.is_dir() else source.stem
+            found += gather_exe(folder, here / "logs" / name, index, skipped, limit)
+        # MULLION_TRACE_DIR names one folder for every process, so the files sit at its root as well
+        if gather_exe(logs, here / "logs", index, skipped, limit):
+            found += 1
+        # a flight record sits beside the folder, named after the executable
+        found += gather_flights(logs, here / "flight", index, skipped, args.exe, limit)
+        if skipped:
+            index.append(f"  {len(skipped)} file(s) over {limit // 1048576} MB were not copied, because a report "
+                         f"has to be attachable (--max-size raises it): " + ", ".join(skipped[:6]) +
+                         ("..." if len(skipped) > 6 else ""))
+            index.append("  to send one of those, copy it into the bundle by hand, or narrow --exe to the game that "
+                         "crashed (its flight record is the one that matters)")
+        if not found:
+            index.append("  nothing copied" + (": every file there is larger than the limit; the lines above name "
+                                               "them" if skipped else ": no log, no flight record and no router "
+                                               "record in that folder"))
+
+    if args.diag:
+        gather_diag(args.diag, here / "profile", index)
+    else:
+        for candidate in (Path(os.environ.get("MULLION_DIAG_PATH", "")),):
+            if str(candidate):
+                gather_diag(candidate, here / "profile", index)
+
+    if args.build:
+        gather_runs(Path(args.build).resolve(), here / "runs", index, args.attempts)
+    index.append(f"wine: {wine_version(args.wine) if args.wine else 'not named; pass --wine <the Wine folder>'}")
+
+    (here / "INDEX.txt").write_text("\n".join(index) + "\n")
+    print(f"{here}")
+    for line in index:
+        print(line)
+    print(f"\nAttach {here} to the report. It holds copies; nothing was moved and nothing outside it was written.")
+
+
+if __name__ == "__main__":
+    main()

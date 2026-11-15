@@ -73,6 +73,7 @@ struct SamplerInfo {
   uint32_t arg_index;
   uint32_t arg_cube_index;
   uint32_t arg_metadata_index;
+  uint32_t arg_border_index;
 };
 
 struct ThreadgroupBufferInfo {
@@ -458,6 +459,11 @@ struct SignatureContext {
   // barycentrics come in SM50_BARYCENTRIC_ROWS
   bool barycentric_rows = false;
   uint32_t unorm_output_reg_mask;
+  // 24 when the bound depth is emulated D24 and written depth is rounded to that unorm
+  uint32_t depth_unorm_bits = 0;
+  // the v# register SV_Position was declared into, or -1, and the function argument that holds it
+  int position_reg = -1;
+  uint32_t position_arg = ~0u;
   // it is considered optional (as a hint)
   air::MTLPixelFormat pixel_formats[8];
 
@@ -481,6 +487,10 @@ struct SignatureContext {
 };
 
 RegisterComponentType component_type_from_pixel_format(air::MTLPixelFormat format);
+
+// D24 is a float here. floor(z * (2^24-1) + 0.5) in float32 rounds 0.75 up to the next code; this does the multiply
+// in integers, which is what the test's depth word is (D3D11.3 17.11)
+llvm::Value *quantize_d24(llvm::IRBuilder<> &ir, llvm::Value *z);
 
 // the input a stage that writes rasterized positions scales them with (llvm::air::AIRBuilder::RasterScale)
 // (all SM50_RASTER_SCALE_WORDS for a stage that reads the mesh group origin)
@@ -760,8 +770,12 @@ std::vector<std::unique_ptr<BasicBlock>> read_control_flow(
 
 uint32_t next_pow2(uint32_t x);
 
-// the payload a hull shader's object threadgroup leaves: with `groups`, with the groups of workloads too
-size_t estimate_payload_size(SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group, bool groups = false);
+// the payload a hull shader's object threadgroup leaves: with `groups`, with the groups of workloads too, and with
+// `stream_output`, with stream output's place in the draw. the hull shader's largest factor is chosen without either
+// (SM50Initialize), so a stream output pipeline whose payload then passes its limit is refused
+size_t estimate_payload_size(
+    SM50ShaderInternal *pHullStage, float factor, uint32_t patch_per_group, bool groups = false, bool stream_output = false
+);
 
 
 // the tessellation factor a pipeline's stages are built for, and the most segments it cuts an edge into
@@ -784,7 +798,30 @@ uint32_t tessellation_group_limit(
 
 llvm::StructType *tessellation_payload_type(
     SM50ShaderInternal *pHullStage, uint32_t factor_int, air::AirType &types, llvm::LLVMContext &context,
-    uint32_t group_limit = 0
+    uint32_t group_limit = 0, bool stream_output = false
+);
+// a tessellation payload's fields with stream output: the object threadgroup's place in the draw (draw instance,
+// then group of patches) and, 64 bits each as the counters they end in are (D3D11.3 14.5), the primitives each stream
+// had before it; at most this many bytes
+constexpr uint32_t kTessellationStreamOutputGroup = 6, kTessellationStreamOutputBefore = 7;
+constexpr size_t kTessellationStreamOutputPlace = 40;
+
+// stream output after a tessellator, in the hull stage's object threadgroup of 32 threads (`thread` this one's index)
+// for group of patches `patches` of draw instance `instance`: returns the group's place in the draw and, in the
+// writing pass, the primitives each stream had before it (zero in the counting pass). of the object threadgroups
+// that share the group's mesh threadgroups (tessellation_grids) the first (`first_part`) of the draw's first group
+// copies the filled sizes the draw starts at to its scratch in the counting pass, and in the writing pass the first
+// of the draw's last group, which knows every stream's total, moves them on, `vertices` those of a primitive
+std::pair<pvalue, std::array<pvalue, 4>> tessellation_stream_output_object(
+    llvm::IRBuilder<> &builder, air::AirType &types, llvm::Module &module, SM50_SHADER_STREAM_OUTPUT_DATA *so,
+    pvalue targets, pvalue patches, pvalue instance, pvalue thread, pvalue first_part, uint32_t vertices
+);
+uint32_t stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext &context, air::AirType &types);
+
+// the mesh stage of a tessellated draw with stream output and no geometry shader (convert_tessellated_stream_output)
+llvm::Error convert_tessellated_stream_output(
+    SM50ShaderInternal *pDomainStage, SM50ShaderInternal *pHullStage, const char *name, llvm::LLVMContext &context,
+    llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
 );
 
 llvm::Value *setup_domain_stage(

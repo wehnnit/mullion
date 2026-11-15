@@ -21,6 +21,8 @@ public:
   WMT::Reference<WMT::SamplerState> sampler_state_white;
   uint64_t sampler_state_white_handle = 0;
   float border_color[4] = {};
+  uint64_t border_gpu_address = 0;
+  WMT::Reference<WMT::Buffer> border_buffer;
 
   // `reduction` (SM50_SAMPLER_REDUCTION): a minimum or maximum filter, which Metal's sampler applies where it can and
   // the shader emulates elsewhere (the metadata says which)
@@ -29,9 +31,12 @@ public:
       unsigned reduction = 0
   );
 
+  ~Sampler();
+
 private:
   WMTSamplerInfo info_;
   std::atomic<uint32_t> refcount_ = {0u};
+  void *border_host_ = nullptr;
 };
 
 } // namespace mullion

@@ -1,5 +1,6 @@
 LIBRARY d3d12.dll
 EXPORTS
+    GetBehaviorValue = loader_GetBehaviorValue @100
     D3D12CreateDevice = loader_D3D12CreateDevice @101
     D3D12GetDebugInterface = loader_D3D12GetDebugInterface @102
     D3D12CreateRootSignatureDeserializer = loader_D3D12CreateRootSignatureDeserializer
@@ -8,3 +9,6 @@ EXPORTS
     D3D12SerializeVersionedRootSignature = loader_D3D12SerializeVersionedRootSignature
     D3D12GetInterface = loader_D3D12GetInterface
     D3D12EnableExperimentalFeatures = loader_D3D12EnableExperimentalFeatures
+    D3D12CoreCreateLayeredDevice = loader_D3D12CoreCreateLayeredDevice
+    D3D12CoreGetLayeredDeviceSize = loader_D3D12CoreGetLayeredDeviceSize
+    D3D12CoreRegisterLayers = loader_D3D12CoreRegisterLayers

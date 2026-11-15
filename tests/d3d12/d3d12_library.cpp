@@ -208,7 +208,7 @@ main(int argc, char **argv) {
   step("seed %u: create and validate an empty library", seed);
   SetEnvironmentVariableA("MULLION_SHADER_CACHE", "0");
   ComPtr<ID3D12Device2> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   const bool instrumented = count_imports();
   if (argc > 3) {
     step("seed %u: load persisted compute pipeline in another process", seed);
@@ -269,7 +269,7 @@ main(int argc, char **argv) {
   expect(hr == E_INVALIDARG, "a null nonempty blob was accepted: %08lx", hr);
   // another driver's blob, short or long, is a version mismatch, which games answer by building a new library
   const char other_driver[] = "another driver's pipeline library, which is not this one's";
-  for (SIZE_T length : {SIZE_T(4), sizeof(other_driver)}) {
+  for (SIZE_T length : {SIZE_T(4), SIZE_T(sizeof(other_driver))}) {
     hr = device->CreatePipelineLibrary(other_driver, length, __uuidof(ID3D12PipelineLibrary), nullptr);
     expect(hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH, "a foreign blob of %llu bytes: %08lx, want %08lx",
            (UINT64)length, hr, D3D12_ERROR_DRIVER_VERSION_MISMATCH);

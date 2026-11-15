@@ -214,4 +214,18 @@ tessellation_grids(uint32_t workloads, uint32_t primitives, uint32_t instances, 
   return grids;
 }
 
+// stream output after a tessellator keeps, for each object threadgroup, a count of each of its `workloads`'
+// primitives, then with a geometry shader one for each invocation, `primitives` a workload and `instances` each: the
+// counts of a group of SM50StreamOutputScratch. the passes add to the first, so a draw zeroes them as
+// SM50StreamOutputZeroed's words (tessellation_stream_output_zeroed)
+inline uint32_t
+tessellation_stream_output_counts(uint32_t workloads, uint32_t primitives, uint32_t instances, bool geometry) {
+  return workloads * (1 + (geometry ? primitives * instances : 0));
+}
+
+inline uint64_t
+tessellation_stream_output_zeroed(uint64_t groups, uint32_t workloads) {
+  return SM50StreamOutputZeroed(groups) + 16 * groups * workloads;
+}
+
 } // namespace mullion::dxbc

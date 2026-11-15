@@ -429,7 +429,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID riid,
                                               void **ppAdapter) override {
-    InitReturnPtr(ppAdapter);
+    // Wine dxgi.c: null out-pointer is DXGI_ERROR_INVALID_CALL (not E_POINTER).
+    if (!ppAdapter)
+      return FAIL(DXGI_ERROR_INVALID_CALL);
+    *ppAdapter = nullptr;
 
     Com<IDXGIAdapter1> adapter;
     for (UINT i = 0; SUCCEEDED(this->EnumAdapters1(i, &adapter)); i++) {
@@ -453,17 +456,21 @@ public:
                       UINT FeatureSupportDataSize) override {
     switch (Feature) {
     case DXGI_FEATURE_PRESENT_ALLOW_TEARING: {
+      // a wrong size or an unknown feature is DXGI_ERROR_INVALID_CALL, not E_INVALIDARG: Wine asserts that for
+      // sizeof(data) - 1, sizeof(data) + 1 and feature 0x12345678 (dlls/dxgi/tests/dxgi.c:7001-7015), and only the
+      // exact size with a real pointer reaches S_OK. A NULL buffer is not settled by the reference -- Wine carries
+      // that case inside `if (0)` under "Crashes on Windows" -- so refusing it is this build's choice, made because
+      // writing through a caller's null pointer is a crash and a refusal is a reportable answer.
+      if (!pFeatureSupportData || FeatureSupportDataSize != sizeof(BOOL))
+        return FAIL(DXGI_ERROR_INVALID_CALL);
       auto info = static_cast<BOOL *>(pFeatureSupportData);
-
-      if (FeatureSupportDataSize != sizeof(*info))
-        return FAIL(E_INVALIDARG);
 
       *info = TRUE;
       return S_OK;
     }
     default: {
       ERR("DXGIFactory::CheckFeatureSupport: unknown feature ", Feature);
-      return E_INVALIDARG;
+      return DXGI_ERROR_INVALID_CALL;
     }
     }
   };

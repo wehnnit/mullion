@@ -1,9 +1,11 @@
 #include "mullion_sampler.hpp"
 #include "winemetal.h"
 #include "airconv_public.h"
+#include "wsi_platform.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <unordered_map>
 #include <utility>
 #include "log/log.hpp"
@@ -61,6 +63,11 @@ Sampler::decRef() {
   if (refcount_.fetch_sub(1u, std::memory_order_release) == 1u)
     delete this;
 };
+
+Sampler::~Sampler() {
+  border_buffer = {};
+  wsi::aligned_free(border_host_);
+}
 
 // whether the device's samplers reduce as their reductionMode says: Metal ignores the mode unless the min, mag and mip
 // filters are all linear (MTLSamplerDescriptor.reductionMode), and an M4 (Apple9, macOS 27.2) ignores it always. the
@@ -131,6 +138,20 @@ Sampler::createSampler(
       return nullptr;
     ret->sampler_state_white_handle = white_info.gpu_resource_id;
     std::copy_n(border_color, 4, ret->border_color);
+    // SM50_SAMPLER_BORDER: the white twin's id and the color, for the shader's CustomBorder mix
+    ret->border_host_ = wsi::aligned_malloc(MULLION_PAGE_SIZE, MULLION_PAGE_SIZE);
+    if (ret->border_host_) {
+      std::memset(ret->border_host_, 0, MULLION_PAGE_SIZE);
+      auto *gpu_border = reinterpret_cast<SM50_SAMPLER_BORDER *>(ret->border_host_);
+      gpu_border->white_sampler = ret->sampler_state_white_handle;
+      std::copy_n(border_color, 4, gpu_border->color);
+      WMTBufferInfo buf{};
+      buf.length = MULLION_PAGE_SIZE;
+      buf.memory.set(ret->border_host_);
+      buf.options = (WMTResourceOptions)(WMTResourceStorageModeShared | WMTResourceHazardTrackingModeUntracked);
+      ret->border_buffer = device.newBuffer(buf);
+      ret->border_gpu_address = buf.gpu_address;
+    }
   }
   constexpr uint64_t field_max = (1 << SM50_SAMPLER_METADATA_LOD_BITS) - 1;
   auto field = [](float lod) {

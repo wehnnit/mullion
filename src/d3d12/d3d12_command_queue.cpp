@@ -125,7 +125,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   uint64_t timestamp_frequency_ = kGPUTimestampFrequency;
   static uint64_t
   Rescale(uint64_t time, uint64_t to, uint64_t from) {
+    if (!from)
+      return 0;
+#if defined(__SIZEOF_INT128__)
     return uint64_t((unsigned __int128)time * to / from);
+#else
+    /* no 128-bit integers on 32 bits: the quotient carries the large part, and the remainder, which is
+     * below `from`, is scaled on its own. The remainder's product stays exact while `from * to` fits
+     * 64 bits, which the frequencies a timestamp is rescaled between do. */
+    return (time / from) * to + (time % from) * to / from;
+#endif
   }
 
   // MULLION_D3D12_PASS_OVERLAP (on unless 0): a pass waits for the passes before the last ordering point before it,
@@ -761,7 +770,12 @@ private:
     std::shared_ptr<GPURecordChecks> records{};
     HANDLE semaphore{};
     std::function<void()> completed{};
+#ifdef __i386__
+    /* the words are read from the mapping, so the buffer carries memory this side allocated */
+    std::vector<std::tuple<Rc<Buffer>, std::span<const uint32_t>, bool>> omitted{};
+#else
     std::vector<std::tuple<WMT::Reference<WMT::Buffer>, std::span<const uint32_t>, bool>> omitted{};
+#endif
     // the timestamp queries the command buffer samples: the device's counter sample buffer it holds until it
     // completes, and where each sample taken is with the queries it is for
     WMT::Reference<WMT::CounterSampleBuffer> samples{};
@@ -1816,9 +1830,20 @@ public:
           Trace("waits for the timestamps of command buffer ", inflight_cmdbuf_seq_.load());
           if (scope.Settle())
             retired_.Expect(inflight_cmdbuf_seq_ - 1)->wait(false);
-          WMTBufferInfo info{data->count * sizeof(uint64_t), WMTResourceStorageModeShared};
-          auto staging = data->memory ? WMT::Reference<WMT::Buffer>{} : device_->GetMTLDevice().newBuffer(info);
-          memcpy(data->memory ? static_cast<char *>(data->memory) + data->dst_offset : info.memory.ptr,
+          Rc<Buffer> staging_object;
+          if (!data->memory) {
+            staging_object = Rc<Buffer>(new Buffer(data->count * sizeof(uint64_t), device_->GetMTLDevice()));
+            Flags<BufferAllocationFlag> staging_flags;
+#ifdef __i386__
+            /* the CPU writes the timestamps into the mapping, which Metal must not put past 4 GB */
+            staging_flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
+            staging_object->rename(staging_object->allocate(staging_flags));
+          }
+          auto staging = data->memory ? WMT::Reference<WMT::Buffer>{}
+                                      : staging_object->current()->buffer();
+          memcpy(data->memory ? static_cast<char *>(data->memory) + data->dst_offset
+                              : staging_object->current()->mappedMemory(0),
                  &data->heap->timestamps[data->start], data->count * sizeof(uint64_t));
           scope.Start();
           cmdbuf = scope.inflight->cmdbuf;
@@ -1857,8 +1882,14 @@ public:
           auto read = [&](D3D12_GPU_VIRTUAL_ADDRESS address, uint64_t length) {
             uint64_t offset;
             auto allocation = device_->LookupBufferByVA(address, &offset);
-            WMTBufferInfo info{length, WMTResourceStorageModeShared};
-            auto staging = device_->GetMTLDevice().newBuffer(info);
+            Rc<Buffer> staging_object(new Buffer(length, device_->GetMTLDevice()));
+            Flags<BufferAllocationFlag> staging_flags;
+#ifdef __i386__
+            /* the CPU reads the copy out of the mapping, which Metal must not put past 4 GB */
+            staging_flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
+            staging_object->rename(staging_object->allocate(staging_flags));
+            WMT::Reference<WMT::Buffer> staging = staging_object->current()->buffer();
             if (diag::trace_encoders)
               scope.inflight->physical[WMTMetal4Blit]++;
             auto encoder = cmdbuf.blitCommandEncoder();
@@ -1872,7 +1903,7 @@ public:
             else
               encoder.endEncoding();
             settle();
-            auto bytes = static_cast<const char *>(info.memory.get());
+            auto bytes = static_cast<const char *>(staging_object->current()->mappedMemory(0));
             return std::vector<char>(bytes, bytes + length);
           };
           bool deserialize = data->command == LaterEncoderData::Copy &&
@@ -2085,8 +2116,13 @@ public:
           size_t count = 0;
           for (auto omitted = data->omitted; omitted; omitted = omitted->next)
             count += omitted->words;
-          WMTBufferInfo info{count * sizeof(uint32_t), WMTResourceStorageModeShared};
-          auto buffer = device_->GetMTLDevice().newBuffer(info);
+          Rc<Buffer> buffer_object(new Buffer(count * sizeof(uint32_t), device_->GetMTLDevice()));
+          Flags<BufferAllocationFlag> buffer_flags;
+#ifdef __i386__
+          buffer_flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
+          buffer_object->rename(buffer_object->allocate(buffer_flags));
+          WMT::Reference<WMT::Buffer> buffer = buffer_object->current()->buffer();
           if (!buffer) {
             device_->LoseDevice();
             return false;
@@ -2102,7 +2138,12 @@ public:
           for (auto omitted = data->omitted; omitted; omitted = omitted->next) {
             copy.copyFromBuffer(omitted->buffer, omitted->offset, buffer, offset * sizeof(uint32_t), omitted->words * sizeof(uint32_t));
             inflight.omitted.emplace_back(
-                buffer, std::span(static_cast<const uint32_t *>(info.memory.get()) + offset, omitted->words),
+#ifdef __i386__
+                buffer_object,
+#else
+                buffer,
+#endif
+                std::span(static_cast<const uint32_t *>(buffer_object->current()->mappedMemory(0)) + offset, omitted->words),
                 omitted->scratch
             );
             offset += omitted->words;

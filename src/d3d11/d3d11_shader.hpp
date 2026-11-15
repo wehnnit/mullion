@@ -123,6 +123,9 @@ struct ShaderVariantPixel {
   bool single_raster_sample = false;
   bool paired_samples = false;
   uint32_t clip_distances = 0;
+  uint32_t depth_unorm_bits = 0;
+  bool diamond_lines = false;
+  bool plane_slope = false;
   std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
   std::array<SM50_SHADER_BLEND, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.blend)> blend{};
   bool operator==(const this_type &rhs) const = default;
@@ -164,6 +167,9 @@ struct ShaderVariantStreamOutput {
   uint32_t input_primitive;
   bool pass_through;
   bool quad_lines;
+  bool diamond_lines = false;
+  bool depth_max = false;
+  bool plane_slope = false;
   bool operator==(const this_type &rhs) const = default;
 };
 

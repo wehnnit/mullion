@@ -18,8 +18,11 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <mutex>
 #include "mullion_format.hpp"
 #include "com/com_pointer.hpp"
 
@@ -32,8 +35,18 @@ namespace mullion {
 static uint64_t
 SmallResourceEstimate(const D3D12_RESOURCE_DESC &Desc, const MTL_DXGI_FORMAT_DESC &Format) {
   uint32_t block = Format.Flag & MTL_DXGI_FORMAT_BC ? 4 : 1;
+#if defined(__SIZEOF_INT128__)
   unsigned __int128 size = (unsigned __int128)Desc.Width * Desc.Height * Format.BytesPerTexel / (block * block);
   return size > UINT64_MAX ? UINT64_MAX : uint64_t(size);
+#else
+  /* no 128-bit integers on 32 bits: the product saturates at UINT64_MAX step by step instead. */
+  uint64_t size = Desc.Width;
+  if (__builtin_mul_overflow(size, Desc.Height, &size))
+    return UINT64_MAX;
+  if (__builtin_mul_overflow(size, uint64_t(Format.BytesPerTexel), &size))
+    return UINT64_MAX;
+  return size / (block * block);
+#endif
 }
 
 HRESULT
@@ -273,10 +286,46 @@ WithinSlices(UINT first, UINT count, UINT length) {
   return first < length && count <= length - first;
 }
 
+// the list is the one thread's that holds the lock, which the thread's id names: a creation of another thread, with no
+// list or with its own once this one's is done, sees none of it
+static std::mutex castable_lock;
+static std::atomic<DWORD> castable_owner = 0;
+static std::span<const DXGI_FORMAT> castable_formats;
+
+CastableFormats::CastableFormats(UINT Count, const DXGI_FORMAT *pFormats) : held_(Count != 0) {
+  if (!held_)
+    return;
+  castable_lock.lock();
+  castable_formats = std::span<const DXGI_FORMAT>(pFormats, Count);
+  castable_owner = GetCurrentThreadId();
+}
+
+CastableFormats::~CastableFormats() {
+  if (!held_)
+    return;
+  castable_owner = 0;
+  castable_formats = {};
+  castable_lock.unlock();
+}
+
+std::span<const DXGI_FORMAT>
+CastableFormats::Current() {
+  return castable_owner == GetCurrentThreadId() ? castable_formats : std::span<const DXGI_FORMAT>();
+}
+
 class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  // the formats besides its own that views of it may have, from its format list (D3D12 Relaxed Format Casting)
+  std::vector<DXGI_FORMAT> castable_;
+
+  // whether a view of `Format` may be made: a format of the texture's type, or one it was created to be cast to
+  bool
+  ViewableAs(DXGI_FORMAT Format) const {
+    return DXGIFormatType(Format) == DXGIFormatType(desc_.Format) ||
+           std::find(castable_.begin(), castable_.end(), Format) != castable_.end();
+  }
   bool reserved_ = false; // its tiles are mapped to heaps (UpdateTileMappings)
   // a reserved texture with all its memory (dense_tiles): the tail its sparse texture would have, first mip and bytes
   std::pair<uint64_t, uint64_t> dense_tail_{};
@@ -314,6 +363,31 @@ public:
     HRESULT hr = PopulateWMTTextureInfo(device_, texture_info, desc_, ~0u);
     if (FAILED(hr))
       return hr;
+    // a CPU-visible heap's texture mirrors the bytes the application maps, which for a decoded BC SNORM
+    // format are the raw blocks: the Metal storage takes the block format, whose SNORM views Metal has
+    MTL_DXGI_FORMAT_DESC storage_format;
+    if (SUCCEEDED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, storage_format)) &&
+        (storage_format.Flag & MTL_DXGI_FORMAT_BC_SNORM_DECODED) && IsCpuVisibleHeap(pHeapProps))
+      texture_info.pixel_format = storage_format.PixelFormat == WMTPixelFormatRG32Float ? WMTPixelFormatBC5_RGUnorm
+                                                                                        : WMTPixelFormatBC4_RUnorm;
+
+    // a format list names formats the texture's texels may be read and written as: ones of its size, which views of it
+    // take through Metal's pixel format views (only the ID3D12Device10 creation calls are given one)
+    if (auto formats = CastableFormats::Current(); !formats.empty()) {
+      MTL_DXGI_FORMAT_DESC own;
+      if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, own)) ||
+          (own.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR))
+        return FAIL(E_INVALIDARG);
+      for (auto format : formats) {
+        MTL_DXGI_FORMAT_DESC cast;
+        if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), format, cast)) ||
+            (cast.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR) || cast.BytesPerTexel != own.BytesPerTexel ||
+            ((cast.Flag ^ own.Flag) & MTL_DXGI_FORMAT_BC))
+          return FAIL(E_INVALIDARG);
+      }
+      castable_.assign(formats.begin(), formats.end());
+      texture_info.usage = WMTTextureUsage(texture_info.usage | WMTTextureUsagePixelFormatView);
+    }
 
     if (!desc_.MipLevels)
       desc_.MipLevels = texture_info.mipmap_level_count;
@@ -483,6 +557,16 @@ public:
     if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)) ||
         !std::has_single_bit(Format.BytesPerTexel))
       return FAIL(E_INVALIDARG);
+    // a CPU-visible heap's storage is the raw blocks even for a decoded BC SNORM format (the resource's
+    // creation gave the Metal texture the block format over the mapped bytes): the box and the rows speak
+    // the block format's identity, not the float texels the GPU-private storage would hold
+    if (Format.Flag & MTL_DXGI_FORMAT_BC_SNORM_DECODED)
+      if (FAILED(MTLQueryDXGIFormat(
+              device_->GetMTLDevice(), Format.PixelFormat == WMTPixelFormatRG32Float ? DXGI_FORMAT_BC5_UNORM
+                                                                                     : DXGI_FORMAT_BC4_UNORM,
+              Format
+          )))
+        return FAIL(E_INVALIDARG);
     if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
         !IsCpuVisibleHeap(&heap_props_))
       return FAIL(E_INVALIDARG);
@@ -533,6 +617,16 @@ public:
     if (FAILED(MTLQueryDXGIFormat(device_->GetMTLDevice(), desc_.Format, Format)) ||
         !std::has_single_bit(Format.BytesPerTexel))
       return FAIL(E_INVALIDARG);
+    // a CPU-visible heap's storage is the raw blocks even for a decoded BC SNORM format (the resource's
+    // creation gave the Metal texture the block format over the mapped bytes): the box and the rows speak
+    // the block format's identity, not the float texels the GPU-private storage would hold
+    if (Format.Flag & MTL_DXGI_FORMAT_BC_SNORM_DECODED)
+      if (FAILED(MTLQueryDXGIFormat(
+              device_->GetMTLDevice(), Format.PixelFormat == WMTPixelFormatRG32Float ? DXGI_FORMAT_BC5_UNORM
+                                                                                     : DXGI_FORMAT_BC4_UNORM,
+              Format
+          )))
+        return FAIL(E_INVALIDARG);
     if (Plane >= Format.PlanarCount || (Plane && !(Format.Flag & MTL_DXGI_FORMAT_VIDEO_PLANAR)) ||
         !IsCpuVisibleHeap(&heap_props_))
       return FAIL(E_INVALIDARG);
@@ -579,6 +673,36 @@ public:
     return S_OK;
   };
 
+  /* the SNORM companion of a raw BC4/BC5 storage: made on the first copy that writes the resource or
+   * the first SNORM view of it, whichever comes first. Its allocation holds the shader-write usage the
+   * decode kernel needs, which the raw storage's own never carries */
+  Texture *
+  BcSnormCompanion() {
+    bool rg = texture->pixelFormat() == WMTPixelFormatBC5_RGUnorm;
+    if (!rg && texture->pixelFormat() != WMTPixelFormatBC4_RUnorm)
+      return nullptr;
+    if (!texture->bc_snorm) {
+      auto info = texture->info();
+      info.pixel_format = rg ? WMTPixelFormatRG32Float : WMTPixelFormatR32Float;
+      info.usage = WMTTextureUsage(info.usage | WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+      texture->bc_snorm = new Texture(info, device_->GetMTLDevice());
+      Flags<TextureAllocationFlag> flags;
+      flags.set(TextureAllocationFlag::GpuPrivate);
+      auto allocation = texture->bc_snorm->allocate(flags);
+      if (!allocation || !allocation->texture()) {
+        texture->bc_snorm = nullptr;
+        return nullptr;
+      }
+      texture->bc_snorm->rename(std::move(allocation));
+    }
+    return texture->bc_snorm.ptr();
+  }
+
+  Texture *
+  BcSnormCompanionOf() {
+    return BcSnormCompanion();
+  }
+
   // whether mips [mip, mip + mips) and array slices [slice, slice + slices) are the texture's, a count of ~0u being
   // the rest. a view of others is refused: Metal has no such view to make, and the fields a view keeps them in are
   // narrower than the description's
@@ -614,15 +738,35 @@ public:
                               : ViewDesc.Format != DXGI_FORMAT_R8_UNORM && ViewDesc.Format != DXGI_FORMAT_R8_UINT))
         return FAIL(E_INVALIDARG);
     }
+    // a SNORM view of BC4/BC5 blocks reads the companion's exact decode: the storage stays the raw
+    // blocks every copy and lock speaks, and the companion holds the floats the spec's endpoint formula
+    // decodes, which Metal's own RSnorm view does not keep (its endpoints go through a promotion that
+    // also skips the spec's clamp)
+    Texture *companion = nullptr;
+    if (ViewDesc.Format == DXGI_FORMAT_BC4_SNORM || ViewDesc.Format == DXGI_FORMAT_BC5_SNORM) {
+      companion = mullion::BcSnormCompanion(texture, device_->GetMTLDevice());
+      ERR("DBGS srv fmt=", ViewDesc.Format, " companion=", companion ? "made" : "failed", " raw_pf=", int(texture->pixelFormat()));
+    }
+
     TextureViewKey View = texture->fullView;
 
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+    if (FAILED(hr) || (!this->texture->chroma && !ViewableAs(ViewDesc.Format)))
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, metal_format.PixelFormat);
+    if (companion) {
+      // the companion's texels are the decode: the view reads them as the float format they are
+      view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, companion->pixelFormat());
+      texture = companion;
+      View = texture->fullView;
+    } else if (ViewDesc.Format == DXGI_FORMAT_BC4_SNORM)
+      // the companion could not be made: the RSnorm view of the same blocks is the decode's nearest answer
+      view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, WMTPixelFormatBC4_RSnorm);
+    else if (ViewDesc.Format == DXGI_FORMAT_BC5_SNORM)
+      view_descriptor.format = EncodeComponentMapping(ViewDesc.Shader4ComponentMapping, WMTPixelFormatBC5_RGSnorm);
 
     if (texture->pixelFormat() == WMTPixelFormatDepth32Float || texture->pixelFormat() == WMTPixelFormatDepth16Unorm) {
       view_descriptor.format = EncodeComponentMapping(
@@ -825,7 +969,7 @@ public:
     const bool r32 = ViewDesc.Format == DXGI_FORMAT_R32_UINT || ViewDesc.Format == DXGI_FORMAT_R32_SINT ||
                      ViewDesc.Format == DXGI_FORMAT_R32_FLOAT;
     if (FAILED(hr) || !(desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ||
-        (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format) &&
+        (!this->texture->chroma && !ViewableAs(ViewDesc.Format) &&
          !(r32 && CastsToR32UnorderedAccess(desc_.Format)))) {
       WARN("CreateUnorderedAccessView: format ", ViewDesc.Format, ", dimension ", ViewDesc.ViewDimension,
            " of a texture of format ", desc_.Format, ", flags ", desc_.Flags);
@@ -937,7 +1081,7 @@ public:
     TextureViewDescriptor view_descriptor;
     MTL_DXGI_FORMAT_DESC metal_format;
     hr = MTLQueryDXGIFormat(device_->GetMTLDevice(), ViewDesc.Format, metal_format);
-    if (FAILED(hr) || (!this->texture->chroma && DXGIFormatType(ViewDesc.Format) != DXGIFormatType(desc_.Format)))
+    if (FAILED(hr) || (!this->texture->chroma && !ViewableAs(ViewDesc.Format)))
       return FAILED(hr) ? hr : FAIL(E_INVALIDARG);
 
     // a swizzled view is read only: an attachment stores the channels as they are (RenderTargetChannels)
@@ -1279,6 +1423,11 @@ public:
     return count;
   }
 };
+
+Texture *
+BcSnormCompanionOf(MTLD3D12Resource *resource) {
+  return static_cast<MTLD3D12Texture *>(resource)->BcSnormCompanionOf();
+}
 
 HRESULT
 CreateCommittedTexture(

@@ -29,7 +29,7 @@ main(int argc, char **argv) {
   if (!expect(!vertex.empty() && !pixels[0].empty() && !pixels[1].empty(), "block HLSL did not compile"))
     return verdict();
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1};
   D3D12_ROOT_PARAMETER parameters[2] = {
       {D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE}, {D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS}
@@ -241,7 +241,8 @@ main(int argc, char **argv) {
                       ) +
                       x * 4;
                   if (!matches(f, bytes[mip].data(), wide, x, y, pixel)) {
-                    expect(false, "texel %u,%u is %.9g %.9g %.9g %.9g", x, y, pixel[0], pixel[1], pixel[2], pixel[3]);
+                    auto decoded = decode(f, bytes[mip].data() + ((y / 4) * ((wide + 3) / 4) + x / 4) * f.bytes, (y % 4) * 4 + x % 4);
+                    expect(false, "texel %u,%u is %.9g %.9g %.9g %.9g, want %.9g %.9g %.9g %.9g", x, y, pixel[0], pixel[1], pixel[2], pixel[3], decoded.value[0], decoded.value[1], decoded.value[2], decoded.value[3]);
                     same = false;
                     break;
                   }

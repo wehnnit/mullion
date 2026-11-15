@@ -20,8 +20,11 @@
 #include "mullion_resource_initializer.hpp"
 #include "mullion_format.hpp"
 #include "util_math.hpp"
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace mullion {
 
@@ -227,6 +230,48 @@ ResourceInitializer::initWithZero(
   return current_seq_id_;
 }
 
+// D3D11.3 19.5.6/.7. Apple's BC4/BC5 signed decoder is not exact at 0, so the texels are stored decoded.
+static double
+bc4_value(const uint8_t *block, unsigned texel, bool signed_values) {
+  int e0 = block[0], e1 = block[1];
+  if (signed_values) {
+    if (e0 > 127)
+      e0 -= 256;
+    if (e1 > 127)
+      e1 -= 256;
+  }
+  uint64_t bits = 0;
+  for (unsigned i = 0; i < 6; i++)
+    bits |= uint64_t(block[2 + i]) << (8 * i);
+  unsigned index = (bits >> (texel * 3)) & 7;
+  double a = signed_values ? std::max(-1.0, e0 / 127.0) : e0 / 255.0;
+  double b = signed_values ? std::max(-1.0, e1 / 127.0) : e1 / 255.0;
+  if (index == 0)
+    return a;
+  if (index == 1)
+    return b;
+  if (e0 > e1)
+    return ((8 - int(index)) * a + (int(index) - 1) * b) / 7;
+  if (index < 6)
+    return ((6 - int(index)) * a + (int(index) - 1) * b) / 5;
+  return index == 6 ? (signed_values ? -1.0 : 0.0) : 1.0;
+}
+static std::vector<uint8_t>
+decode_bc_snorm(const void *blocks, uint32_t width, uint32_t height, size_t row_pitch, bool rg) {
+  unsigned channels = rg ? 2u : 1u;
+  unsigned block_bytes = channels * 8;
+  std::vector<uint8_t> out(size_t(width) * height * channels * sizeof(float));
+  auto *dst = reinterpret_cast<float *>(out.data());
+  for (uint32_t y = 0; y < height; y++)
+    for (uint32_t x = 0; x < width; x++) {
+      auto *block = static_cast<const uint8_t *>(ptr_add(blocks, (y / 4) * row_pitch + (x / 4) * block_bytes));
+      unsigned texel = (y % 4) * 4 + (x % 4);
+      for (unsigned c = 0; c < channels; c++)
+        dst[(size_t(y) * width + x) * channels + c] = float(bc4_value(block + c * 8, texel, true));
+    }
+  return out;
+}
+
 uint64_t
 ResourceInitializer::initWithData(
     const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
@@ -235,6 +280,26 @@ ResourceInitializer::initWithData(
   auto width_sub = std::max(1u, texture->width() >> level);
   auto height_sub = std::max(1u, texture->height() >> level);
   auto depth_sub = std::max(1u, texture->depth() >> level);
+
+  std::vector<uint8_t> decoded;
+  if (format_flags & MTL_DXGI_FORMAT_BC_SNORM_DECODED) {
+    bool rg = texture->pixelFormat() == WMTPixelFormatRG32Float;
+    decoded = decode_bc_snorm(data, width_sub, height_sub, row_pitch, rg);
+    data = decoded.data();
+    row_pitch = size_t(width_sub) * (rg ? 8u : 4u);
+    depth_pitch = row_pitch * height_sub;
+  } else if (texture->pixelFormat() == WMTPixelFormatBC4_RUnorm || texture->pixelFormat() == WMTPixelFormatBC5_RGUnorm) {
+    // a signed view of these blocks is decoded from the copy kept here (19.5.2)
+    size_t channels = texture->pixelFormat() == WMTPixelFormatBC5_RGUnorm ? 2 : 1;
+    size_t blocks_x = (width_sub + 3) / 4, blocks_y = (height_sub + 3) / 4, block_bytes = channels * 8;
+    auto &mips = const_cast<Texture *>(texture)->bc_mips;
+    if (mips.size() <= level)
+      mips.resize(level + 1);
+    auto &stored = mips[level];
+    stored.resize(blocks_x * blocks_y * block_bytes);
+    for (size_t row = 0; row < blocks_y; row++)
+      memcpy(stored.data() + row * blocks_x * block_bytes, ptr_add(data, row * row_pitch), blocks_x * block_bytes);
+  }
 
   auto block_size = 1u;
 

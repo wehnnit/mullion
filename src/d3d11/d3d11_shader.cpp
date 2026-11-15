@@ -184,6 +184,9 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.single_raster_sample);
   h.update(variant.paired_samples);
   h.update(variant.clip_distances);
+  h.update(variant.depth_unorm_bits);
+  h.update(variant.diamond_lines);
+  h.update(variant.plane_slope);
   h.update(variant.blend);
   auto variant_digest = h.final();
   std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
@@ -203,6 +206,9 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.single_raster_sample = variant.single_raster_sample;
     data.paired_samples = variant.paired_samples;
     data.clip_distances = variant.clip_distances;
+    data.depth_unorm_bits = variant.depth_unorm_bits;
+    data.diamond_lines = variant.diamond_lines;
+    data.plane_slope = variant.plane_slope;
     data.cull_distances = 0;
     data.cull_depth = false;
     std::copy(variant.blend.begin(), variant.blend.end(), data.blend);
@@ -375,6 +381,9 @@ hash_stream_output(Sha1HashState &h, const ShaderVariantStreamOutput &variant) {
   h.update(variant.input_primitive);
   h.update(variant.pass_through);
   h.update(variant.quad_lines);
+  h.update(variant.diamond_lines);
+  h.update(variant.depth_max);
+  h.update(variant.plane_slope);
   if (!variant.layout)
     return;
   h.update(variant.layout->Digest());
@@ -458,6 +467,9 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     geometry.input_primitive = variant.stream_output.input_primitive;
     geometry.pass_through = variant.stream_output.pass_through;
     geometry.quad_lines = variant.stream_output.quad_lines;
+    geometry.diamond_lines = variant.stream_output.diamond_lines;
+    geometry.depth_max = variant.stream_output.depth_max;
+    geometry.plane_slope = variant.stream_output.plane_slope;
     geometry.pipeline_statistics = variant.pipeline_statistics;
     geometry.clip_distance_varyings = variant.clip_distance_varyings;
 

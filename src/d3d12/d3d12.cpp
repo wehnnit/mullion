@@ -16,6 +16,7 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include "../mullion/mullion_router.hpp"
 #include "d3d12.h"
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
@@ -50,6 +51,10 @@ Logger Logger::s_instance("d3d12.log");
 
 extern "C" HRESULT WINAPI
 D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice) {
+
+  if (!mullion::router::offered(
+          mullion::router::Request{mullion::router::Api::D3D12, false, false, uint32_t(MinimumFeatureLevel)}))
+    return E_NOINTERFACE;
 
   Com<IDXGIAdapter> dxgi_adapter = nullptr;
   Com<IDXGIFactory4> dxgi_factory = nullptr;
@@ -266,6 +271,33 @@ D3D12EnableExperimentalFeatures(UINT NumFeatures, const IID *pIIDs, void *pConfi
     experimental_shader_models = true;
   return S_OK;
 }
+
+// the device-layer entry points of Windows' table (Wine's d3d12.spec stubs them): there are no layers to register,
+// and a layered device is not made
+extern "C" HRESULT WINAPI
+D3D12CoreRegisterLayers(const void *, UINT) {
+  return S_OK;
+}
+
+extern "C" SIZE_T WINAPI
+D3D12CoreGetLayeredDeviceSize(const void *, UINT) {
+  return 0;
+}
+
+extern "C" HRESULT WINAPI
+D3D12CoreCreateLayeredDevice(const void *, UINT, const void *, REFIID, void **device) {
+  if (device)
+    *device = nullptr;
+  return E_NOTIMPL;
+}
+
+// Wine's d3d12.spec lists this at ordinal 100 as a stub. d3d12.lib's import is two arguments
+// (_GetBehaviorValue@8): the behavior's name and the value to leave in place when it is unset.
+// nothing here configures behaviors, so the caller's default stands.
+extern "C" UINT WINAPI GetBehaviorValue(const WCHAR *, UINT default_value) { return default_value; }
+
+// the Agility SDK version this core is, which a D3D12Core.dll exports as data (d3d12core.def)
+extern "C" const UINT D3D12SDKVersion = D3D12_SDK_VERSION;
 
 BOOL WINAPI
 DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {

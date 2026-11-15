@@ -1,5 +1,6 @@
 # each test checks one contract of the D3D11 API; see the comment at the top of each file
 d3d11_test_deps = [cpp.find_library('d3d11'), cpp.find_library('dxgi'), cpp.find_library('d3dcompiler_47')]
+d3d11_link = powf_stub
 
 # the sources a test has beside its own
 d3d11_test_sources = { 'tessellator': files('../reference/reference.cpp') }
@@ -7,11 +8,12 @@ d3d11_test_sources = { 'tessellator': files('../reference/reference.cpp') }
 d3d11_test_links = { 'bridge_errors': [winemetal_dep], 'gpu_family': [winemetal_dep] }
 # the arguments a test compiles with
 d3d11_test_args = { 'fullscreen': test_d3d12 ? ['-DTEST_D3D12'] : [] }
-foreach name : ['blending', 'block_values', 'clear_values', 'constant_updates', 'depth_stencil', 'depth_values', 'discard', 'dxbc_arithmetic', 'dxbc_calls', 'dynamic_initial', 'format_blend', 'format_logic', 'format_msaa', 'format_values', 'generate_mips', 'ia_draws', 'ia_formats', 'ia_patches', 'logic', 'om_order', 'om_uav', 'raster', 'raster_bias', 'raster_samples', 'raster_state', 'resinfo', 'resolve', 'resource_dimensions', 'resource_usage', 'sample_mask', 'msaa8', 'coverage_blend', 'sample_positions', 'shader_groups', 'structured_copies', 'texture_updates', 'uav_counters', 'anisotropy_bias', 'geometry_indirect_parts', 'geometry_parts', 'geometry_oversize', 'trace_encoders', 'sample_compare', 'sample_compare_1d', 'integer_rare', 'gs_restart', 'atomics_rare', 'rgb32', 'sincos', 'clear_rectangles', 'copy_formats', 'resource_creation', 'view_creation', 'shared_texture_crossprocess', 'shared_mutex_race', 'device_arguments', 'psout', 'device_teardown', 'default_updates', 'default_allocations', 'default_growth', 'bridge_errors', 'planar', 'feature_queries', 'shared_resource', 'shared_release', 'subresource_surface', 'interface_eligibility', 'device_interfaces', 'shader_levels', 'swapchain_buffers', 'initial_data', 'texture1d_initial', 'input_layout', 'streamout_declarations', 'copy_region', 'staging_depth', 'timestamp', 'fullscreen', 'profile', 'queries', 'deferred_release', 'state_objects', 'buffer_loads', 'atomic_bounds', 'shared_fence', 'fence_reached', 'fence_event_handles', 'staging_order', 'commandlist_state', 'map_contract', 'state_transitions', 'occlusion_many', 'streamout', 'streamout_scratch', 'drawauto', 'assembly', 'primitiveid', 'tessellator', 'predication', 'staging', 'state', 'viewports', 'rectangles_many', 'surface', 'indices', 'device', 'constants', 'minlod', 'formats', 'packed', 'garbled', 'null_indices', 'null_stage_indices', 'dynamic_generations', 'ps_writes', 'minmax_filters', 'default_sampler', 'no_vertex_shader', 'gpu_family']
+foreach name : ['blending', 'block_values', 'clear_values', 'constant_updates', 'depth_stencil', 'depth_values', 'discard', 'dxbc_arithmetic', 'dxbc_calls', 'dynamic_initial', 'format_blend', 'format_logic', 'format_msaa', 'format_values', 'generate_mips', 'ia_draws', 'ia_formats', 'ia_patches', 'logic', 'om_order', 'om_uav', 'raster', 'raster_bias', 'raster_samples', 'raster_state', 'resinfo', 'resolve', 'resource_dimensions', 'resource_usage', 'sample_mask', 'msaa8', 'coverage_blend', 'sample_positions', 'shader_groups', 'structured_copies', 'texture_updates', 'uav_counters', 'anisotropy_bias', 'geometry_indirect_parts', 'geometry_parts', 'geometry_oversize', 'trace_encoders', 'sample_compare', 'sample_compare_1d', 'integer_rare', 'gs_restart', 'atomics_rare', 'rgb32', 'sincos', 'clear_rectangles', 'copy_formats', 'resource_creation', 'view_creation', 'shared_texture_crossprocess', 'shared_mutex_race', 'device_arguments', 'psout', 'device_teardown', 'default_updates', 'default_allocations', 'default_growth', 'bridge_errors', 'planar', 'feature_queries', 'shared_resource', 'shared_release', 'subresource_surface', 'interface_eligibility', 'device_interfaces', 'shader_levels', 'swapchain_buffers', 'initial_data', 'texture1d_initial', 'input_layout', 'streamout_declarations', 'copy_region', 'staging_depth', 'timestamp', 'fullscreen', 'profile', 'queries', 'deferred_release', 'state_objects', 'buffer_loads', 'atomic_bounds', 'shared_fence', 'fence_reached', 'fence_event_handles', 'staging_order', 'commandlist_state', 'map_contract', 'state_transitions', 'occlusion_many', 'streamout', 'streamout_scratch', 'drawauto', 'assembly', 'primitiveid', 'tessellator', 'predication', 'staging', 'state', 'viewports', 'rectangles_many', 'surface', 'indices', 'device', 'constants', 'minlod', 'formats', 'packed', 'garbled', 'null_indices', 'null_stage_indices', 'dynamic_generations', 'ps_writes', 'minmax_filters', 'default_sampler', 'no_vertex_shader', 'gpu_family', 'border', 'device_removal', 'hwnd', 'present_flags', 'sampler_limit']
   # without the shader cache, so a test meets the shaders this build makes
   test('d3d11_' + name,
        executable('d3d11_' + name, ['d3d11_' + name + '.cpp'] + d3d11_test_sources.get(name, []),
                   dependencies : d3d11_test_deps + d3d11_test_links.get(name, []),
+                  link_with : d3d11_link,
                   cpp_args : d3d11_test_args.get(name, [])),
        env : ['MULLION_SHADER_CACHE=0'], timeout : 600)
 endforeach
@@ -23,6 +25,10 @@ foreach part : ['creation', 'wrapped', 'wait', 'unwrap', 'swapchain', 'lifetime'
          env : ['MULLION_SHADER_CACHE=0'], timeout : 600)
   endforeach
 endif
+# d3d11.dll's export table: every name Windows 10's and Wine's tables have resolves, and each is called safely with
+# the argument bytes Windows' callers push
+test('d3d11_exports', executable('d3d11_exports', ['d3d11_exports.cpp'], dependencies : d3d11_test_deps),
+     env : ['MULLION_SHADER_CACHE=0'], timeout : 300)
 # no test: the runner's way to see where the threads of a test that outlived its time are
 # workloads tests/held.py profiles
 executable('d3d11_held', 'd3d11_held.cpp', dependencies : d3d11_test_deps)

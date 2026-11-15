@@ -1959,12 +1959,17 @@ _MTLCaptureManager_startCapture(void *obj) {
   // a capture that does not start says why in <trace>.error.txt (and on stderr): Metal starts none without
   // MTL_CAPTURE_ENABLED=1 in the process's environment, or where the trace already exists
   if (![manager startCaptureWithDescriptor:desc error:&error]) {
+    params->ret = false;
     NSString *why = [NSString stringWithFormat:@"Metal did not start the capture (trace documents supported: %d): %@\n",
                                                (int)[manager supportsDestination:desc.destination],
                                                error ? error.localizedDescription : @"no error given"];
     fprintf(stderr, "mullion: %s", why.UTF8String);
     [why writeToFile:[path_str stringByAppendingString:@".error.txt"] atomically:YES encoding:NSUTF8StringEncoding
                error:nil];
+  } else {
+    // the answer a caller can act on. it was never written here, so MTLCaptureManager_startCapture returned
+    // uninitialised stack to every caller, and nothing could tell an accepted capture from a refused one
+    params->ret = true;
   }
   [url release];
   [path_str release];
@@ -2357,6 +2362,84 @@ _MTLDevice_supportsFXDenoisedScaler(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_supportsFXFrameInterpolator(void *obj) {
+  struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->handle;
+  params->ret = 0;
+  // "MetalFX frame interpolation", which like Apple's scalers is offered on Apple9 and newer
+  if (@available(macOS 26.0, *))
+    params->ret = family_has(9) && (params->arg ? [MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device]
+                                                : [MTLFXFrameInterpolatorDescriptor supportsDevice:device]);
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newFrameInterpolator(void *obj) {
+  struct unixcall_mtldevice_newframeinterpolator *params = obj;
+  params->ret = NULL_OBJECT_HANDLE;
+  if (@available(macOS 26.0, *)) {
+    id<MTLDevice> device = (id<MTLDevice>)params->device;
+    const struct WMTFXFrameInterpolatorInfo *info = params->info.ptr;
+    MTLFXFrameInterpolatorDescriptor *desc;
+    id<MTL4Compiler> compiler = nil;
+
+    if (!family_has(9) || (params->metal4 ? ![MTLFXFrameInterpolatorDescriptor supportsMetal4FX:device]
+                                          : ![MTLFXFrameInterpolatorDescriptor supportsDevice:device]))
+      return STATUS_SUCCESS;
+    if (params->metal4 && !(compiler = metalfx_compiler(device)))
+      return STATUS_SUCCESS;
+    desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
+    desc.depthTextureFormat = to_metal_pixel_format(info->depth_format);
+    desc.motionTextureFormat = to_metal_pixel_format(info->motion_format);
+    desc.outputTextureFormat = to_metal_pixel_format(info->output_format);
+    if (info->ui_format != WMTPixelFormatInvalid)
+      desc.uiTextureFormat = to_metal_pixel_format(info->ui_format);
+    desc.inputWidth = info->input_width;
+    desc.inputHeight = info->input_height;
+    desc.outputWidth = info->output_width;
+    desc.outputHeight = info->output_height;
+    // the scaler whose history this interpolation reads. both MTLFXTemporalScalerBase and
+    // MTLFXTemporalDenoisedScalerBase conform to MTLFXFrameInterpolatableScaler, Metal 4 objects included, so the
+    // handle carries no kind with it; 0 leaves the descriptor's own nil and interpolates the game's frames
+    if (info->scaler)
+      desc.scaler = (__bridge id<MTLFXFrameInterpolatableScaler>)(void *)info->scaler;
+    params->ret = params->metal4 ? (obj_handle_t)[desc newFrameInterpolatorWithDevice:device compiler:compiler]
+                                 : (obj_handle_t)[desc newFrameInterpolatorWithDevice:device];
+    [desc release];
+    [compiler release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_encodeFrameInterpolation(void *obj) {
+  struct unixcall_mtlcommandbuffer_interpolate_frame *params = obj;
+  if (@available(macOS 26.0, *)) {
+    const struct WMTFXFrameInterpolateArgs *args = params->args.ptr;
+    id<MTLFXFrameInterpolator> fx = (id<MTLFXFrameInterpolator>)params->interpolator;
+    fx.colorTexture = (id<MTLTexture>)args->color;
+    fx.prevColorTexture = (id<MTLTexture>)args->prev_color;
+    fx.depthTexture = (id<MTLTexture>)args->depth;
+    fx.motionTexture = (id<MTLTexture>)args->motion;
+    fx.outputTexture = (id<MTLTexture>)args->output;
+    if (args->ui)
+      fx.uiTexture = (id<MTLTexture>)args->ui;
+    if (args->fence)
+      fx.fence = (id<MTLFence>)args->fence;
+    fx.motionVectorScaleX = args->motion_vector_scale_x;
+    fx.motionVectorScaleY = args->motion_vector_scale_y;
+    fx.jitterOffsetX = args->jitter_offset_x;
+    fx.jitterOffsetY = args->jitter_offset_y;
+    fx.deltaTime = args->delta_time;
+    fx.shouldResetHistory = args->reset;
+    fx.depthReversed = args->depth_reversed;
+    [fx encodeToCommandBuffer:(id<MTLCommandBuffer>)params->cmdbuf];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MetalLayer_setProps(void *obj) {
   struct unixcall_generic_obj_constptr_noret *params = obj;
   CAMetalLayer *layer = (CAMetalLayer *)params->handle;
@@ -2502,17 +2585,22 @@ _CreateMetalViewFromHWND(void *obj) {
     pfn_macdrv_view_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
   }
 
+  params->ret_view = NULL_OBJECT_HANDLE;
+  params->ret_layer = NULL_OBJECT_HANDLE;
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
-    macdrv_metal_view view =
-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
-    params->ret_view = (obj_handle_t)view;
-    if (view) {
-      params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+    if (win_data) {
+      macdrv_metal_view view =
+          pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
+      params->ret_view = (obj_handle_t)view;
+      if (view) {
+        params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+      }
+      pfn_release_win_data(win_data);
     }
-    pfn_release_win_data(win_data);
-  } else if (objc_getClass("WineWindow")) {
+  }
+  if (!params->ret_view && objc_getClass("WineWindow")) {
     // a Wine whose winemac.drv exports nothing (WineHQ's) still has its Cocoa window in the process. the layer is
     // made here and shown later, by the main thread, which this one must not wait for: it may be waiting on us
     MullionMetalHost *host = [[MullionMetalHost alloc] init];
@@ -2845,6 +2933,26 @@ struct SM50_SHADER_ROOT_SIGNATURE_DATA32 {
   uint64_t static_samplers;
 };
 
+struct SM50_SHADER_MESH_SHADER_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t pixel_shader_bytecode;
+  bool conservative;
+  bool amplified;
+  uint32_t triangles;
+  uint32_t slices;
+  uint32_t flat_inputs;
+  uint32_t noperspective_inputs;
+  bool barycentrics;
+};
+
+struct SM50_SHADER_LIBRARIES_DATA32 {
+  uint32_t next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
+  uint32_t libraries;
+  uint32_t count;
+};
+
 void
 sm50_compilation_argument32_convert(
     struct SM50_SHADER_COMPILATION_ARGUMENT_DATA *first_arg, struct SM50_SHADER_COMPILATION_ARGUMENT_DATA32 *args32
@@ -2950,14 +3058,39 @@ sm50_compilation_argument32_convert(
       break;
     }
     case SM50_SHADER_MESH_SHADER: {
-      // next, type, then the pixel shader's bytecode
-      uint32_t *src = (void *)args32;
+      struct SM50_SHADER_MESH_SHADER_DATA32 *src = (void *)args32;
       struct SM50_SHADER_MESH_SHADER_DATA *data = calloc(1, sizeof(struct SM50_SHADER_MESH_SHADER_DATA));
+      if (!data) {
+        args32 = NULL;
+        break;
+      }
       last_arg->next = data;
       last_arg = (void *)data;
       last_arg->next = NULL;
-      data->type = args32->type;
-      data->pixel_shader_bytecode = UInt32ToPtr(src[2]);
+      data->type = src->type;
+      data->pixel_shader_bytecode = UInt32ToPtr(src->pixel_shader_bytecode);
+      data->conservative = src->conservative;
+      data->amplified = src->amplified;
+      data->triangles = src->triangles;
+      data->slices = src->slices;
+      data->flat_inputs = src->flat_inputs;
+      data->noperspective_inputs = src->noperspective_inputs;
+      data->barycentrics = src->barycentrics;
+      break;
+    }
+    case SM50_SHADER_LIBRARIES: {
+      struct SM50_SHADER_LIBRARIES_DATA32 *src = (void *)args32;
+      struct SM50_SHADER_LIBRARIES_DATA *data = malloc(sizeof(struct SM50_SHADER_LIBRARIES_DATA));
+      if (!data) {
+        args32 = NULL;
+        break;
+      }
+      last_arg->next = data;
+      last_arg = (void *)data;
+      last_arg->next = NULL;
+      data->type = src->type;
+      data->libraries = UInt32ToPtr(src->libraries);
+      data->count = src->count;
       break;
     }
     case SM50_SHADER_RAY_SHADER: {
@@ -3018,7 +3151,12 @@ sm50_compilation_argument32_convert(
     }
     case SM50_SHADER_ARGUMENT_TYPE_MAX:
       break;
+    default:
+      // unknown node: skip it and follow the chain (a newer PE half must not crash an older unix half)
+      break;
     }
+    if (!args32)
+      break;
     args32 = UInt32ToPtr(args32->next);
   }
 }
@@ -4194,8 +4332,12 @@ _MTLDevice_supportsPlacementSparse(void *obj) {
   struct unixcall_generic_obj_uint64_ret *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->handle;
   params->ret = 0;
-  if (@available(macOS 26.4, *))
-    params->ret = [device supportsPlacementSparse];
+  // supportsPlacementSparse came with macOS 26.4 and so is declared by no earlier SDK, though every
+  // system that has it answers. ask for the selector the way MullionPlace asks a WINDOW for its hwnd
+  if (@available(macOS 26.4, *)) {
+    if ([device respondsToSelector:@selector(supportsPlacementSparse)])
+      params->ret = ((BOOL (*)(id, SEL))objc_msgSend)(device, @selector(supportsPlacementSparse));
+  }
   return STATUS_SUCCESS;
 }
 
@@ -5416,6 +5558,8 @@ _WMTDeviceReport(void *obj) {
   ANSWER(supportsFXTemporalScaler, one, );
   ANSWER(supportsFXDenoisedScaler, two, 0, ".metal3");
   ANSWER(supportsFXDenoisedScaler, two, 1, ".metal4");
+  ANSWER(supportsFXFrameInterpolator, two, 0, ".metal3");
+  ANSWER(supportsFXFrameInterpolator, two, 1, ".metal4");
   ANSWER(supportsBCTextureCompression, one, );
   ANSWER(supports32BitFloatFiltering, one, );
   ANSWER(supports32BitMSAA, one, );
@@ -7386,6 +7530,9 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_sparseTailHolds,
     &_MTLDevice_sparseResidencyInTiles,
     &_MTLDevice_newSpecializedRenderPipeline,
+    &_MTLDevice_supportsFXFrameInterpolator,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolation,
 };
 
 #ifndef MULLION_NATIVE
@@ -7603,10 +7750,37 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_sparseTailHolds,
     &_MTLDevice_sparseResidencyInTiles,
     &_MTLDevice_newSpecializedRenderPipeline,
+    &_MTLDevice_supportsFXFrameInterpolator,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolation,
 };
 _Static_assert(sizeof(__wine_unix_call_wow64_funcs) / sizeof(__wine_unix_call_wow64_funcs[0]) == WMTUnixCallCount,
                "32-bit bridge call count");
+// ordering, not only the length: inserting a call in the middle of one half and appending it on the other
+// keeps the counts equal and still routes the wrong unix function
+static void
+winemetal_wow64_order(void) __attribute__((constructor));
+static void
+winemetal_wow64_order(void) {
+  // last entry is WMTUnixDeviceNewSpecializedRenderPipeline (winemetal.h), and SampledEncoder stays at
+  // its fixed index: both together say a call was appended to each table, not inserted into one
+  if (__wine_unix_call_wow64_funcs[WMTUnixSampledEncoder] != &_MTLCommandBuffer_sampledCommandEncoder ||
+      __wine_unix_call_wow64_funcs[WMTUnixCallCount - 1] != &_MTLCommandBuffer_encodeFrameInterpolation) {
+    fprintf(stderr, "winemetal: 32-bit bridge call table is out of order\n");
+    abort();
+  }
+}
 #endif
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == WMTUnixCallCount,
                "bridge call count");
+static void
+winemetal_unix_order(void) __attribute__((constructor));
+static void
+winemetal_unix_order(void) {
+  if (__wine_unix_call_funcs[WMTUnixSampledEncoder] != &_MTLCommandBuffer_sampledCommandEncoder ||
+      __wine_unix_call_funcs[WMTUnixCallCount - 1] != &_MTLCommandBuffer_encodeFrameInterpolation) {
+    fprintf(stderr, "winemetal: bridge call table is out of order\n");
+    abort();
+  }
+}

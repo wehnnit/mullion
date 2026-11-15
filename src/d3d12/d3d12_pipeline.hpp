@@ -62,6 +62,9 @@ public:
   }
 };
 
+// true when InitializeShader interned this parse: RayLibrary must not SM50Destroy it
+bool SM50ShaderIsInterned(sm50_shader_t shader);
+
 HRESULT PipelineKey(const D3D12_COMPUTE_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key);
 HRESULT PipelineKey(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC &Desc, Sha1Digest &Key, bool DepthBounds = false,
@@ -107,8 +110,10 @@ public:
     return sm50_shader_;
   }
 
+  // InitializeShader interns a parse and hands that object to every pipeline of the bytecode. the table owns it
+  // for the process, so a pipeline must not destroy it (SM50ShaderIsInterned)
   ~SM50Shader() {
-    if (sm50_shader_)
+    if (sm50_shader_ && !SM50ShaderIsInterned(sm50_shader_))
       SM50Destroy(sm50_shader_);
   }
 };

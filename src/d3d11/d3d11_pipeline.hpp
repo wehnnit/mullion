@@ -40,6 +40,14 @@ struct MTL_GRAPHICS_PIPELINE_DESC {
   bool PassThrough;
   // the lines it passes on are quadrilaterals (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA)
   bool QuadLines;
+  // aliased lines: a wider quad the pixel shader accepts with the diamond-exit rule
+  bool DiamondLines = false;
+  // float depth bias needs the primitive's greatest |window z|, which a mesh stage can see
+  bool DepthMax = false;
+  // wireframe slope bias is the triangle plane's gradient, which the mesh stage writes
+  bool PlaneSlope = false;
+  // 16 or 24 when the depth buffer is a unorm of that width stored for the test; 0 for a float depth
+  uint32_t DepthUnormBits = 0;
   bool PipelineStatistics = false;
 };
 
@@ -95,6 +103,10 @@ template <> struct hash<MTL_GRAPHICS_PIPELINE_DESC> {
     state.add((size_t)v.InputPrimitive);
     state.add((size_t)v.PassThrough);
     state.add(v.QuadLines);
+    state.add(v.DiamondLines);
+    state.add(v.DepthMax);
+    state.add(v.PlaneSlope);
+    state.add(v.DepthUnormBits);
     state.add(v.PipelineStatistics);
     state.add((size_t)v.SampleCount);
     state.add((size_t)v.NumColorAttachments);
@@ -169,6 +181,8 @@ template <> struct equal_to<MTL_GRAPHICS_PIPELINE_DESC> {
            (x.ClipDistances == y.ClipDistances) &&
            (x.GSPassthrough == y.GSPassthrough) && (x.SOLayout == y.SOLayout) &&
            (x.InputPrimitive == y.InputPrimitive) && (x.PassThrough == y.PassThrough) && (x.QuadLines == y.QuadLines) &&
+           (x.DiamondLines == y.DiamondLines) && (x.DepthMax == y.DepthMax) && (x.PlaneSlope == y.PlaneSlope) &&
+           (x.DepthUnormBits == y.DepthUnormBits) &&
            (x.PipelineStatistics == y.PipelineStatistics);
   }
 };
@@ -201,6 +215,10 @@ public:
   const MTL_GRAPHICS_PIPELINE_DESC *description;
   virtual void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pTessellationPipeline, bool statistics = false) = 0;
 };
+
+// depth-only draws have no pixel shader; this writes D3D's biased, viewport-clamped depth. diamond lines discard
+// the quad pixels the diamond-exit rule misses
+WMT::Function DepthCorrectFunction(WMT::Device device, bool diamond, bool depth_max);
 
 std::unique_ptr<MTLCompiledGraphicsPipeline>
 CreateGraphicsPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);

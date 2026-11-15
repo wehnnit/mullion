@@ -24,6 +24,7 @@
 #include "d3d12_device_child.hpp"
 #include "mullion_sampler.hpp"
 #include "util_math.hpp"
+#include "wsi_platform.hpp"
 #include "util_md5.hpp"
 #include <bit>
 #include <cstring>
@@ -445,6 +446,9 @@ class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignatu
   */
   std::vector<uint64_t> static_samplers_encoded_;
   WMT::Reference<WMT::Buffer> static_samplers_buffer_;
+#ifdef __i386__
+  std::shared_ptr<void> static_samplers_host_;
+#endif
 
 public:
   MTLD3D12RootSignatureImpl(MTLD3D12Device *pDevice, const void *pBytecode, SIZE_T BytecodeLength) :
@@ -596,6 +600,13 @@ public:
       EncodedStaticSamplers = static_samplers_encoded_.data();
       if (desc.Flags & D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE) {
         WMTBufferInfo info{static_samplers_encoded_.size() * sizeof(uint64_t), WMTResourceStorageModeShared};
+#ifdef __i386__
+        /* the CPU writes the samplers into the mapping, which Metal must not put past 4 GB */
+        static_samplers_host_ = std::shared_ptr<void>(wsi::aligned_malloc(info.length, MULLION_PAGE_SIZE), wsi::aligned_free);
+        if (!static_samplers_host_)
+          return FAIL(E_OUTOFMEMORY);
+        info.memory.set(static_samplers_host_.get());
+#endif
         static_samplers_buffer_ = device_->GetMTLDevice().newBuffer(info);
         if (!static_samplers_buffer_)
           return FAIL(E_OUTOFMEMORY);

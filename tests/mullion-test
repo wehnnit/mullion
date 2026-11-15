@@ -35,6 +35,9 @@ def main():
     parser.add_argument("--stage", default=",".join(STAGES), help="the stages to run (default: %(default)s)")
     parser.add_argument("--coverage", type=Path, help="a coverage build, for the coverage stage")
     args = parser.parse_args()
+    # an acceptance run has no result without provenance: a manifest that cannot be made or does not prove what ran
+    # fails it (tests/manifest.py verify)
+    args.require_manifest = True
     stages = args.stage.split(",")
     tests = run.chosen(args)
     wrong = {}
@@ -43,7 +46,7 @@ def main():
         wrong["tests failed"] = run.own(args, tests, *run.environment(args))
     if "conformance" in stages:
         print("== conformance", flush=True)
-        wrong["verdicts differ"] = conformance.conformance(args, *run.environment(args))
+        wrong["conformance failures"] = conformance.conformance(args, *run.environment(args))
     if "coverage" in stages and args.coverage:
         print("== coverage", flush=True)
         notes = args.coverage.resolve() / "notes"

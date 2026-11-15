@@ -156,6 +156,8 @@ struct D3D11DepthStencilView : ID3D11DepthStencilView {
   uint64_t view_id_{};
   MTL_RENDER_PASS_ATTACHMENT_DESC pass_desc_;
   WMTPixelFormat format_{};
+  // 16 or 24 for a unorm depth the test quantizes to; 0 for a float depth
+  uint32_t depth_unorm_bits_ = 0;
   uint32_t readonly_flags_{};
   RenamableTexturePool *renamable_{};
   ResourceSubsetState subset_{};
@@ -165,6 +167,10 @@ struct D3D11DepthStencilView : ID3D11DepthStencilView {
   pixelFormat() const {
     return format_;
   };
+  uint32_t
+  depthUnormBits() const {
+    return depth_unorm_bits_;
+  }
   const MTL_RENDER_PASS_ATTACHMENT_DESC &
   description() const {
     return pass_desc_;

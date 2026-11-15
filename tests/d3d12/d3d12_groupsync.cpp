@@ -64,7 +64,7 @@ main(int argc, char **argv) {
           return verdict();
       }
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   auto bridge = GetModuleHandleA("winemetal.dll");
   CHECK(bridge ? S_OK : E_FAIL);
   auto initialize = reinterpret_cast<decltype(&SM50Initialize)>(GetProcAddress(bridge, "SM50Initialize"));
@@ -133,7 +133,7 @@ main(int argc, char **argv) {
               SM50_COMPILED_BITCODE bytes{};
               get_bytes(bitcode, &bytes);
               if (expect(bytes.Data && bytes.Size, "compiled bytes returned"))
-                compiled[run].assign((const char *)bytes.Data, bytes.Size);
+                compiled[run].assign((const char *)(uint64_t)bytes.Data, bytes.Size);
             }
             if (bitcode)
               free_bitcode(bitcode);

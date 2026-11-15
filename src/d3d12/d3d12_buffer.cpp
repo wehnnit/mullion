@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "d3d12_pageable.hpp"
+#include "mullion_buffer.hpp"
 #include "com/com_pointer.hpp"
 #include "mullion_format.hpp"
 
@@ -89,6 +90,12 @@ public:
     buffer = new Buffer(length, device_->GetMTLDevice());
 
     Flags<BufferAllocationFlag> flags;
+#ifdef __i386__
+    /* a buffer the application can Map must carry memory this side allocated: Metal maps a buffer it
+     * made itself above 4 GB, which a 32-bit process cannot touch. */
+    if (!Reserved && !pHeap)
+      flags.set(BufferAllocationFlag::CpuPlaced);
+#endif
     if (Reserved)
       buffer->rename(buffer->allocate(flags, device_->GetSparsePageSize()));
     else if (memory)
@@ -226,12 +233,16 @@ public:
     if (FAILED(device_->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
         !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER))
       return FAIL(E_INVALIDARG);
-    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat};
-    Slice.firstElement = ViewDesc.Buffer.FirstElement * (Format.BytesPerTexel / MTLGetTexelSize(Format.BufferPixelFormat));
-    Slice.elementCount = ViewDesc.Buffer.NumElements |
-                         (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? SM50_TEXEL_BUFFER_METADATA_RGB32 : 0);
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
     Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
+    auto texel = MTLGetTexelSize(Format.BufferPixelFormat);
+    auto window = typedBufferWindow(Slice.byteOffset, Slice.byteLength, texel);
+    BufferViewDescriptor view_descriptor{
+        Format.BufferPixelFormat, false, window.byte_offset, window.byte_length
+    };
+    Slice.firstElement = typedBufferShaderIndex(window, texel);
+    Slice.elementCount = ViewDesc.Buffer.NumElements |
+                         (Format.Flag & MTL_DXGI_FORMAT_EMULATED_RGB32 ? SM50_TEXEL_BUFFER_METADATA_RGB32 : 0);
 
     auto view = buffer->createView(view_descriptor);
     return Heap->AddShaderResourceView(Index, buffer.ptr(), view, Slice);
@@ -286,11 +297,13 @@ public:
         !(support.Support1 & D3D12_FORMAT_SUPPORT1_BUFFER) ||
         !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW))
       return FAIL(E_INVALIDARG);
-    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat, true};
-    Slice.firstElement = ViewDesc.Buffer.FirstElement;
-    Slice.elementCount = ViewDesc.Buffer.NumElements;
     Slice.byteOffset = Format.BytesPerTexel * ViewDesc.Buffer.FirstElement;
     Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
+    auto texel = MTLGetTexelSize(Format.BufferPixelFormat);
+    auto window = typedBufferWindow(Slice.byteOffset, Slice.byteLength, texel);
+    BufferViewDescriptor view_descriptor{Format.BufferPixelFormat, true, window.byte_offset, window.byte_length};
+    Slice.firstElement = typedBufferShaderIndex(window, texel);
+    Slice.elementCount = ViewDesc.Buffer.NumElements;
 
     auto view = buffer->createView(view_descriptor);
     return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice);

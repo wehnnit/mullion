@@ -188,7 +188,7 @@ public:
       if (auto Known = llvm::dyn_cast<llvm::ConstantInt>(Index)) {
         auto At = Known->getZExtValue() - Sampler.range.lower_bound + Sampler.arg_index;
         if (At < StaticSamplerStates.size())
-          std::tie(Static.Anisotropic, Static.Biased, Static.Reduces) = StaticSamplerStates[At];
+          std::tie(Static.Anisotropic, Static.Reduces) = StaticSamplerStates[At];
       }
       return Static;
     }
@@ -381,8 +381,8 @@ public:
   llvm::StructType *RootArgumentsType = nullptr;
   llvm::Value *RootArguments = nullptr;
   llvm::Value *StaticSamplers = nullptr;
-  // each static sampler's anisotropy and LOD bias as its metadata has them (mullion::Sampler::createSampler)
-  std::vector<std::tuple<bool, bool, bool>> StaticSamplerStates;
+  // each static sampler's anisotropy and whether it reduces as its metadata has them (mullion::Sampler::createSampler)
+  std::vector<std::tuple<bool, bool>> StaticSamplerStates;
   uint32_t SparseBufferMappingsIndex;
   llvm::Value *SparseBufferMappings = nullptr;
 
@@ -733,8 +733,6 @@ setup_binding_rootsig(
     auto &State = root_sig.pStaticSamplers[i];
     binding_map->StaticSamplerStates.emplace_back(
         D3D12_DECODE_IS_ANISOTROPIC_FILTER(State.Filter) && State.MaxAnisotropy > 1,
-        std::lround(std::clamp(std::ldexp(State.MipLODBias, SM50_SAMPLER_METADATA_LOD_FRACTION_BITS), (float)INT16_MIN,
-                               (float)INT16_MAX)) != 0,
         D3D12_DECODE_FILTER_REDUCTION(State.Filter) == D3D12_FILTER_REDUCTION_TYPE_MINIMUM ||
             D3D12_DECODE_FILTER_REDUCTION(State.Filter) == D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
     );

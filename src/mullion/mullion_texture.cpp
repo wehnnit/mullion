@@ -262,6 +262,51 @@ Texture::view(TextureViewKey key) {
   return view(key, current_.ptr());
 }
 
+/* the decoded companion of a raw BC4/BC5 storage: made on the first SNORM view, its allocation holds
+ * the shader-read and shader-write usage the decode kernel needs */
+Texture *
+BcSnormCompanion(Texture *texture, WMT::Device device) {
+  // the decode kernel reads and writes two-dimensional views, which a 3D storage's slices are not
+  if (texture->textureType() == WMTTextureType3D)
+    return nullptr;
+  bool rg = texture->pixelFormat() == WMTPixelFormatBC5_RGUnorm;
+  if (!rg && texture->pixelFormat() != WMTPixelFormatBC4_RUnorm)
+    return nullptr;
+  if (!texture->bc_snorm) {
+    auto info = texture->info();
+    info.pixel_format = rg ? WMTPixelFormatRG32Float : WMTPixelFormatR32Float;
+    info.usage = WMTTextureUsage(info.usage | WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite);
+    texture->bc_snorm = new Texture(info, device);
+    Flags<TextureAllocationFlag> flags;
+    flags.set(TextureAllocationFlag::GpuPrivate);
+    auto allocation = texture->bc_snorm->allocate(flags);
+    if (!allocation || !allocation->texture()) {
+      texture->bc_snorm = nullptr;
+      return nullptr;
+    }
+    texture->bc_snorm->rename(std::move(allocation));
+  }
+  return texture->bc_snorm.ptr();
+}
+
+static mullion::mutex bc_snorm_pending_lock;
+static std::vector<std::pair<Rc<Texture>, Rc<Texture>>> bc_snorm_pending;
+
+void
+MarkBcSnormCompanionPending(Texture *raw, Texture *companion) {
+  std::lock_guard<mullion::mutex> lock(bc_snorm_pending_lock);
+  for (auto &[pending_raw, pending_companion] : bc_snorm_pending)
+    if (pending_companion == companion)
+      return;
+  bc_snorm_pending.push_back({Rc<Texture>(raw), Rc<Texture>(companion)});
+}
+
+std::vector<std::pair<Rc<Texture>, Rc<Texture>>>
+DrainBcSnormCompanionPending() {
+  std::lock_guard<mullion::mutex> lock(bc_snorm_pending_lock);
+  return std::exchange(bc_snorm_pending, {});
+}
+
 TextureView &
 Texture::view(TextureViewKey key, TextureAllocation* allocation) {
   // read under the lock too: adding a view may move the list, though not the views it points to

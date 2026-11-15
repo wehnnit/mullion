@@ -34,7 +34,7 @@ presents(IDXGISwapChain1 *chain) {
 static int
 child() {
   ComPtr<ID3D12Device5> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   ComPtr<ID3D12CommandQueue> queue;
   D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
   CHECK(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)));
@@ -109,6 +109,7 @@ main(int argc, char **argv) {
   SetEnvironmentVariableA("MULLION_TRACE_DIR", unix_folder);
   HeapFree(GetProcessHeap(), 0, unix_folder);
 
+  bool skipped_child = false;
   auto run = [&](bool traced) {
     SetEnvironmentVariableA("MULLION_TRACE_SYNC", traced ? "1" : nullptr);
     SetEnvironmentVariableA("MULLION_TRACE_PRESENT", traced ? "1" : nullptr);
@@ -126,7 +127,10 @@ main(int argc, char **argv) {
     GetExitCodeProcess(process.hProcess, &status);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
-    expect(waited == WAIT_OBJECT_0 && status == 0, "child exit %lu, wait %lu", status, waited);
+    if (waited == WAIT_OBJECT_0 && status == 77)
+      skipped_child = true;
+    else
+      expect(waited == WAIT_OBJECT_0 && status == 0, "child exit %lu, wait %lu", status, waited);
   };
 
   step("a launch that traces sync, present and gpu");
@@ -158,5 +162,7 @@ main(int argc, char **argv) {
   std::error_code error;
   std::filesystem::remove_all(folder, error);
   expect(!error, "log folder removed: %s", error.message().c_str());
+  if (skipped_child)
+    return verdict_skipped("the child could not make its Direct3D 12 device");
   return verdict();
 }

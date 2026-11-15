@@ -6,7 +6,21 @@
 #ifndef __AIRCONV_H
 #define __AIRCONV_H
 
-#define AIRCONV_VERSION 103
+// 99: a static sampler with a MaxAnisotropy above 1 keeps D3D's ratio-then-bias LOD at a bias of 0 too
+// 100: stream output after a tessellator; a tessellation payload has room for its place
+// 101: D24 depth is quantized, depth bias follows D3D, aliased lines use the diamond-exit rule
+// 104: BC4/BC5 SNORM snap stops at 8/8128, so a real 9/8128 step is kept
+// 105: a geometry shader's line quad is culled from both endpoints
+// 106: float depth bias takes the primitive's greatest |z|
+// 107: a D24 code is stored as the float the unorm pack reads back as that code
+// 108: wireframe slope bias uses the triangle plane
+// 109: a structured or raw buffer slot given a typed view reads the view's first byte, 4 bytes an element
+// 110: this branch's converter merged with upstream's, whose 100..103 were its own changes to the generated IR --
+//      a structured load bounded inside its element, an unbiased anisotropic heap sampler on Metal's LOD, a geometry
+//      or mesh function that writes a layer and no viewport taking viewport 0, and the 8-sample raster path. The
+//      merged converter is neither parent's, so it takes a number above both (109 and 103) rather than either: a
+//      cache written by one parent must not serve the other's IR (CODE.md 4.2).
+#define AIRCONV_VERSION 110
 
 #ifdef __cplusplus
 #include <string>
@@ -56,6 +70,8 @@ enum SM50_BINDING_INDEX: uint32_t {
      combiners (SM50_SHADING_RATE), then the shading rate image's bytes, a D3D12_SHADING_RATE for each tile */
   SM50_BINDING_INDEX_SHADING_RATE = SM50_BINDING_INDEX_DEPTH_BOUNDS_SAMPLES + 1,
   SM50_BINDING_INDEX_SHADING_RATE_IMAGE = SM50_BINDING_INDEX_SHADING_RATE + 1,
+  /* depth bias the fragment shader applies (D3D11.3 15.10): bias, slope scale, clamp, unorm bits, apply, pad, MinDepth, MaxDepth */
+  SM50_BINDING_INDEX_DEPTH_BIAS = 20,
 
   SM50_BINDING_INDEX_ROOT_ARGUMENTS = 0,
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
@@ -66,6 +82,9 @@ enum SM50_BINDING_INDEX: uint32_t {
 /* the word of SM50_BINDING_INDEX_RASTER_SCALE's buffer the mesh group origin starts at, and the buffer's words */
 #define SM50_RASTER_SCALE_MESH_ORIGIN (1 + 2 * SM50_VIEWPORTS)
 #define SM50_RASTER_SCALE_WORDS (SM50_RASTER_SCALE_MESH_ORIGIN + 3)
+/* after those words, each viewport's origin x, origin y, MinDepth and MaxDepth, for aliased lines */
+#define SM50_RASTER_SCALE_VIEWPORT SM50_RASTER_SCALE_WORDS
+#define SM50_RASTER_SCALE_VIEWPORT_WORDS (SM50_RASTER_SCALE_VIEWPORT + 4 * SM50_VIEWPORTS)
 
 /* the bytes before the lock table of 64-bit atomics, which every root signature's arguments name, are the header of
  * an acceleration structure of nothing: what a null structure is to a ray query */
@@ -446,6 +465,8 @@ enum SM50_SHADER_METAL_VERSION {
 // a texture's or texel buffer's metadata: its texture stands for an unbound one, and what it answers is dropped. the
 // bit is above every array length, W slice and element count the metadata holds
 #define SM50_TEXTURE_METADATA_UNBOUND (1ull << 62)
+/* the texture is BC4 or BC5 signed: Apple's decoder returns -1/8128 where D3D11.3 19.5.2 requires exact 0 */
+#define SM50_TEXTURE_METADATA_BC_SNORM (1ull << 61)
 
 /* the sampler metadata qword that shaders read next to the sampler states: MipLODBias as a signed 16-bit LOD in
    bits 0-15, then whether the minification, magnification and mip filters are linear and MaxAnisotropy (1 unless the
@@ -625,6 +646,12 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
      (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative_hull), so the shader tests no pixel, and writes the depth
      only where Metal would clamp it otherwise: when the shader may discard or change its coverage, or writes memory */
   bool conservative_hull;
+  /* D24 is stored as a float. the shader rounds depth to 24-bit unorm before the test (D3D11.3 17.11). 0 otherwise */
+  uint32_t depth_unorm_bits;
+  /* aliased lines are a quad the pixel shader tests with the diamond-exit rule (D3D11.3 3.4.4) */
+  bool diamond_lines;
+  /* wireframe slope bias is the triangle's, not the edge's (D3D11.3 15.10). the mesh writes it flat */
+  bool plane_slope;
 };
 
 /* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the corners
@@ -803,6 +830,12 @@ struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {
   /* with conservative_hull: the pixel shader reads SV_InnerCoverage, so the hull's points pass on the polygon too
      (SM50_CONSERVATIVE_VARYINGS), which they otherwise leave out */
   bool conservative_inner;
+  /* lines the geometry shader emits are quadrilaterals the pixel shader tests with the diamond-exit rule */
+  bool diamond_lines;
+  /* float depth bias uses the greatest |window z| in the primitive (D3D11.3 15.10). the mesh writes it flat */
+  bool depth_max;
+  /* wireframe: the mesh writes the triangle plane's dz/dx, dz/dy for the pixel shader (SM50_SHADER_PSO_PIXEL_SHADER_DATA) */
+  bool plane_slope;
 };
 
 struct SM50_SHADER_PSO_TESSELLATOR_DATA {

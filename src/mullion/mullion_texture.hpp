@@ -26,6 +26,7 @@
 #include "thread.hpp"
 #include "util_flags.hpp"
 #include "util_svector.hpp"
+#include <vector>
 
 namespace mullion {
 
@@ -284,6 +285,9 @@ public:
 
   TextureViewKey fullView;
   Rc<Texture> chroma;
+  // original BC4/BC5 blocks, one mip each, and the signed view decoded to snorm texels
+  std::vector<std::vector<uint8_t>> bc_mips;
+  Rc<Texture> bc_snorm;
   Rc<Buffer> render_buffer;
   uint32_t render_buffer_offset = 0;
 
@@ -350,5 +354,16 @@ private:
   unsigned current_index_ = 0;
   std::atomic<uint32_t> refcount_ = {0u};
 };
+
+/* the decoded companion of a raw BC4/BC5 storage: one float per texel channel, holding the values the
+ * spec's endpoint formula decodes, which Metal's own RSnorm sampling does not keep exactly. Made on the
+ * first SNORM view, filled by the copies that write the raw storage, and decoded again when a queued
+ * list starts if it was marked since */
+Texture *BcSnormCompanion(Texture *texture, WMT::Device device);
+
+void MarkBcSnormCompanionPending(Texture *raw, Texture *companion);
+
+/* the pairs hold references: a resource whose descriptor was made may be gone by the time a list starts */
+std::vector<std::pair<Rc<Texture>, Rc<Texture>>> DrainBcSnormCompanionPending();
 
 } // namespace mullion

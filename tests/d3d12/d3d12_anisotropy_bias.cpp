@@ -5,10 +5,13 @@
 // and "clampedLOD = max(MinLOD,(min(MaxLOD, biasedLOD)))". mip m of each texture holds m, and anisotropic filters
 // are linear between mips (7.18.10), so a sample reads its LOD; a comparison passes where the reference is below the
 // texel (LESS), so two references half a mip on either side of the expected LOD tell it apart. footprints are
-// axis-aligned powers of two, so every expected LOD is a whole mip. MaxAnisotropy 1 and a bias of 0 are controls;
-// footprints longer and shorter than MaxAnisotropy on both axes, a 2D and a 2D array texture, descriptor and static
-// samplers, and biases of both signs vary what the conversion of each instruction depends on. the static samplers are
-// listed out of register order after one of another stage, so each is told apart by its register.
+// axis-aligned powers of two, so every expected LOD is a whole mip. MaxAnisotropy 1 is the control. a bias of 0
+// with a MaxAnisotropy above 1 is the grazing case: Metal clamps the ratio after its bias, which at a footprint
+// longer than MaxAnisotropy reads a mip too coarse (a smear) where D3D clamps the ratio first, so every Sample there
+// is held to the clamped footprint's LOD and no coarser. footprints longer and shorter than MaxAnisotropy on both
+// axes, a 2D and a 2D array texture, descriptor and static samplers, and biases of both signs vary what the
+// conversion of each instruction depends on. the static samplers are listed out of register order after one of
+// another stage, so each is told apart by its register.
 #include "d3d12_test.hpp"
 #include <algorithm>
 #include <bit>
@@ -16,7 +19,8 @@
 #include <iterator>
 
 // the footprints in texels of the first mip per pixel along x and y, one 2x2 quad each
-static const float footprints[][2] = {{16, 1}, {1, 16}, {4, 4}, {64, 4}, {2, 1}};
+// the last three are grazing, longer than MaxAnisotropy 4 and 16 by a factor of 2 to 32
+static const float footprints[][2] = {{16, 1}, {1, 16}, {4, 4}, {64, 4}, {2, 1}, {128, 1}, {1, 128}, {32, 2}};
 constexpr unsigned quads = std::size(footprints);
 
 static const char hlsl[] = R"hlsl(
@@ -55,6 +59,13 @@ lod(const float footprint[2], float anisotropy, float bias, unsigned mips) {
   return std::clamp(std::log2(minor) + bias, 0.0f, float(mips - 1));
 }
 
+// whether the footprint's ratio of anisotropy exceeds MaxAnisotropy, so that D3D clamps it (7.18.11)
+static bool
+is_grazing(const float footprint[2], UINT anisotropy) {
+  float major = std::max(footprint[0], footprint[1]);
+  return major * major / (footprint[0] * footprint[1]) > float(anisotropy);
+}
+
 int
 main(int argc, char **argv) {
   Compiler compiler;
@@ -69,7 +80,7 @@ main(int argc, char **argv) {
     return verdict();
 
   ComPtr<ID3D12Device> device;
-  CHECK(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
+  CHECK(make_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)));
   // the largest footprint at the largest bias stays inside the mips
   constexpr UINT size = 256, mips = std::bit_width(size), slices = 2, targets = 5;
   constexpr float depth_scale = 16;
@@ -271,6 +282,7 @@ main(int argc, char **argv) {
   // D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT: the LOD's precision, and so a mip blend's
   const float tolerance = std::ldexp(1.0f, -D3D12_MIP_LOD_FRACTIONAL_BIT_COUNT);
   const char *names[targets] = {"Sample", "Sample of an array", "SampleBias", "SampleCmp below", "SampleCmp above"};
+  unsigned grazing = 0;
   for (UINT i = 0; i < draws; i++)
     for (UINT q = 0; q < quads; q++) {
       auto &draw = plan[i];
@@ -286,8 +298,16 @@ main(int argc, char **argv) {
                                      x * sizeof(float));
             expect(std::fabs(value - wants[k]) <= tolerance, "%s at pixel %u,%u read %g, expected %g", names[k], x, y,
                    value, wants[k]);
+            // a grazing footprint with no bias reads the LOD of the clamped footprint, not a coarser mip
+            if (k < 2 && draw.bias == 0 && draw.anisotropy > 1 && is_grazing(footprints[q], draw.anisotropy)) {
+              grazing++;
+              expect(value <= wants[k] + tolerance, "%s at pixel %u,%u smeared to %g at MaxAnisotropy %u, MipLODBias 0, "
+                     "footprint %gx%g, past the %g of the clamped footprint", names[k], x, y, value, draw.anisotropy,
+                     footprints[q][0], footprints[q][1], wants[k]);
+            }
           }
     }
   readback->Unmap(0, nullptr);
+  expect(grazing > 0, "no sample was grazing at MipLODBias 0");
   return verdict();
 }

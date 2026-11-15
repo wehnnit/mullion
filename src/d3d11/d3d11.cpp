@@ -20,6 +20,7 @@
 #include "com/com_object.hpp"
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
+#include "../mullion/mullion_router.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_on12.hpp"
 #include <bit>
@@ -112,12 +113,31 @@ SelectFeatureLevel(
   return S_OK;
 }
 
-extern "C" HRESULT WINAPI
-D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
-                      UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels,
-                      UINT FeatureLevels, ID3D11Device **ppDevice) {
-  InitReturnPtr(ppDevice);
+// the bits this build keeps in D3D11CreateDevice's Flags for itself. D3D10 is implemented over the Direct3D 11
+// device (its bit has been here since DXMT), and the Direct3D 9 device makes one to draw over
+// (docs/ARCHITECTURE.md section 1). A bit in the call is the only way an entry point in one DLL can learn that the
+// asker is another layer of this build: the static a header-inline function keeps is one per image, so state set in
+// d3d9.dll is not the state d3d11.dll reads. Both bits are stripped from what GetCreationFlags hands back.
+inline constexpr UINT MULLION_D3D10_DEVICE = 0x80000000u;
+inline constexpr UINT MULLION_INTERNAL_DEVICE = 0x40000000u;
+// what says "this build asks, not the application"
+inline constexpr UINT MULLION_INTERNAL_MASK = MULLION_D3D10_DEVICE | MULLION_INTERNAL_DEVICE;
 
+// the highest feature level a request names, as the record says it
+static uint32_t
+asked_feature_level(const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels) {
+  uint32_t asked = 0;
+  for (UINT at = 0; at < FeatureLevels; at++)
+    if (pFeatureLevels && uint32_t(pFeatureLevels[at]) > asked)
+      asked = uint32_t(pFeatureLevels[at]);
+  return asked;
+}
+
+// the creation itself, with no routing in it: exactly one entry point decides about one request, and a decision
+// made twice would be recorded twice
+static HRESULT
+create_device(IDXGIAdapter *pAdapter, UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels,
+              ID3D11Device **ppDevice) {
   Com<IMTLDXGIAdapter> dxgi_adapter;
 
   // Try to find the corresponding Metal device for the DXGI adapter
@@ -147,6 +167,25 @@ D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
   }
 }
 
+extern "C" HRESULT WINAPI
+D3D11CoreCreateDevice(IDXGIFactory *pFactory, IDXGIAdapter *pAdapter,
+                      UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels,
+                      UINT FeatureLevels, ID3D11Device **ppDevice) {
+  InitReturnPtr(ppDevice);
+
+  // Routed, unless the asker is another of this build's own layers. A refusal is a decision about what the
+  // application asked for: `router.d3d11 = False` must not take away the device the Direct3D 9 or Direct3D 10
+  // layer needs in order to render what the title did ask for. An application cannot set the bit: a Flags value
+  // carrying it comes from inside this build alone.
+  if (!(Flags & MULLION_INTERNAL_MASK) &&
+      !mullion::router::offered(
+          mullion::router::Request{mullion::router::Api::D3D11, false, false,
+                                   asked_feature_level(pFeatureLevels, FeatureLevels)}))
+    return E_NOINTERFACE;
+
+  return create_device(pAdapter, Flags, pFeatureLevels, FeatureLevels, ppDevice);
+}
+
 extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     IDXGIAdapter *pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
     UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels, UINT FeatureLevels,
@@ -157,6 +196,10 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
   InitReturnPtr(ppDevice);
   InitReturnPtr(ppSwapChain);
   InitReturnPtr(ppImmediateContext);
+
+  if (!mullion::router::offered(mullion::router::Request{
+          mullion::router::Api::D3D11, false, false, asked_feature_level(pFeatureLevels, FeatureLevels)}))
+    return E_NOINTERFACE;
 
   if (pFeatureLevel)
     *pFeatureLevel = D3D_FEATURE_LEVEL(0);
@@ -207,9 +250,9 @@ extern "C" HRESULT WINAPI D3D11CreateDeviceAndSwapChain(
     if (DriverType != D3D_DRIVER_TYPE_UNKNOWN || Software)
       return E_INVALIDARG;
   }
-  // Create the actual device
-  hr = D3D11CoreCreateDevice(dxgiFactory.ptr(), dxgiAdapter.ptr(), Flags,
-                             pFeatureLevels, FeatureLevels, &device);
+  // Create the actual device. Not through D3D11CoreCreateDevice, which would ask the router the same question a
+  // second time: this entry point has already decided about this request.
+  hr = create_device(dxgiAdapter.ptr(), Flags, pFeatureLevels, FeatureLevels, &device);
 
   if (FAILED(hr))
     return hr;
@@ -344,6 +387,77 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 }
 
 #endif
+
+// PIX event markers that Windows' d3d11.dll exports alongside d3d9's D3DPERF_* (Wine's d3d11.spec has none): no-ops
+// that resolve for titles that import them from d3d11. EndEvent and GetStatus take one 4-byte argument (d3d11.lib's
+// _D3DPerformance_EndEvent@4, _D3DPerformance_GetStatus@4), which a 32-bit stdcall callee has to pop
+extern "C" INT WINAPI D3DPerformance_BeginEvent(DWORD, LPCWSTR) { return 0; }
+extern "C" INT WINAPI D3DPerformance_EndEvent(void *) { return 0; }
+extern "C" DWORD WINAPI D3DPerformance_GetStatus(void *) { return 0; }
+extern "C" void WINAPI D3DPerformance_SetMarker(DWORD, LPCWSTR) {}
+
+// the device-layer entry points of Windows' table (Wine: D3D11CoreRegisterLayers, and stubs for the other two).
+// there are no layers to register, and a layered device is not made
+extern "C" HRESULT WINAPI D3D11CoreRegisterLayers(const void *, DWORD) { return S_OK; }
+extern "C" SIZE_T WINAPI D3D11CoreGetLayeredDeviceSize(const void *, DWORD) { return 0; }
+extern "C" HRESULT WINAPI D3D11CoreCreateLayeredDevice(const void *, DWORD, const void *, REFIID, void **device) {
+  if (device)
+    *device = nullptr;
+  return E_NOTIMPL;
+}
+
+// a user-mode display driver's entry points (D3D10DDIARG_OPENADAPTER *): this d3d11.dll is not a driver
+extern "C" HRESULT WINAPI OpenAdapter10(void *) { return E_NOTIMPL; }
+extern "C" HRESULT WINAPI OpenAdapter10_2(void *) { return E_NOTIMPL; }
+
+// windows.graphics.directx.direct3d11.interop.h: the WinRT IDirect3DDevice / IDirect3DSurface wrappers, which need
+// Windows Runtime classes this build does not have
+extern "C" HRESULT WINAPI CreateDirect3D11DeviceFromDXGIDevice(IDXGIDevice *, IUnknown **device) {
+  if (device)
+    *device = nullptr;
+  return E_NOTIMPL;
+}
+extern "C" HRESULT WINAPI CreateDirect3D11SurfaceFromDXGISurface(IDXGISurface *, IUnknown **surface) {
+  if (surface)
+    *surface = nullptr;
+  return E_NOTIMPL;
+}
+
+// the kernel-thunk names d3d11.dll still carries from Windows 7, each taking one D3DKMT_* argument. the ones Wine's
+// gdi32 has are forwarded there (d3d11.def); the rest answer STATUS_NOT_IMPLEMENTED, as there is no kernel driver
+// internal names: util_d3dkmt.h declares some of these dllimport with a typed argument, which a
+// definition of the same name cannot satisfy. the export name is the Windows one (d3d11.def).
+#define D3DKMT_STUB(name) \
+  extern "C" LONG WINAPI mullion_D3DKMT##name(void *) { return (LONG)0xc0000002; /* STATUS_NOT_IMPLEMENTED */ }
+D3DKMT_STUB(CreateAllocation)
+D3DKMT_STUB(CreateContext)
+D3DKMT_STUB(CreateSynchronizationObject)
+D3DKMT_STUB(DestroyAllocation)
+D3DKMT_STUB(DestroyContext)
+D3DKMT_STUB(DestroySynchronizationObject)
+D3DKMT_STUB(GetContextSchedulingPriority)
+D3DKMT_STUB(GetDeviceState)
+D3DKMT_STUB(GetDisplayModeList)
+D3DKMT_STUB(GetMultisampleMethodList)
+D3DKMT_STUB(GetRuntimeData)
+D3DKMT_STUB(GetSharedPrimaryHandle)
+D3DKMT_STUB(Lock)
+D3DKMT_STUB(OpenResource)
+D3DKMT_STUB(Present)
+D3DKMT_STUB(QueryAllocationResidency)
+D3DKMT_STUB(QueryResourceInfo)
+D3DKMT_STUB(Render)
+D3DKMT_STUB(SetAllocationPriority)
+D3DKMT_STUB(SetContextSchedulingPriority)
+D3DKMT_STUB(SetDisplayMode)
+D3DKMT_STUB(SetDisplayPrivateDriverFormat)
+D3DKMT_STUB(SetGammaRamp)
+D3DKMT_STUB(SignalSynchronizationObject)
+D3DKMT_STUB(Unlock)
+D3DKMT_STUB(WaitForSynchronizationObject)
+D3DKMT_STUB(WaitForVerticalBlankEvent)
+#undef D3DKMT_STUB
+
 
 extern "C" void _massert(const char *_Message, const char *_File,
                          unsigned _Line) {

@@ -4,6 +4,7 @@
 #include "dxbc_converter.hpp"
 #include "nt/air_builder.hpp"
 #include "nt/dxbc_converter_base.hpp"
+#include "tessellation_limits.hpp"
 #include "llvm/IR/Constants.h"
 #include "llvm/Support/Alignment.h"
 #include "llvm/Support/AtomicOrdering.h"
@@ -167,7 +168,7 @@ strip_parity(llvm::IRBuilder<> &builder, llvm::air::AIRBuilder &air, pvalue vali
   );
 }
 
-static uint32_t
+uint32_t
 stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext &context, air::AirType &types) {
   return signature.DefineInput(air::ArgumentBindingBuffer{
       .buffer_size = {},
@@ -178,6 +179,265 @@ stream_output_input(air::FunctionSignatureBuilder &signature, llvm::LLVMContext 
       .type = air::MSLWhateverStruct{"stream_output_targets", stream_output_targets_type(context, types)},
       .raster_order_group = {}
   });
+}
+
+static pvalue
+simd_sum(llvm::IRBuilder<> &builder, llvm::Module &module, pvalue value) {
+  auto &context = builder.getContext();
+  return builder.CreateCall(
+      module.getOrInsertFunction(
+          "air.simd_sum.u.i32", llvm::FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty()}, false),
+          llvm::AttributeList::get(context, {{~0U, llvm::Attribute::get(context, llvm::Attribute::Convergent)}})
+      ),
+      {value}
+  );
+}
+
+// the primitives each stream had before object threadgroup `group` of `groups`, from the counting pass's totals:
+// the threadgroup's `threads` threads, one SIMD group (`thread` this one's index), sum the totals of the blocks
+// before the group's block, then of its block's groups before it, in turn, then over the SIMD group
+static std::array<pvalue, 4>
+stream_output_groups_before(
+    llvm::IRBuilder<> &builder, llvm::Module &module, air::AirType &types, pvalue scratch, pvalue group, pvalue groups,
+    pvalue thread, uint32_t threads
+) {
+  auto &context = builder.getContext();
+  auto function = builder.GetInsertBlock()->getParent();
+  auto blocks_before = builder.CreateLShr(group, kStreamOutputBlockShift);
+  auto block_start = builder.CreateShl(blocks_before, kStreamOutputBlockShift);
+  auto items = builder.CreateAdd(blocks_before, builder.CreateSub(group, block_start));
+  auto blocks = stream_output_blocks(builder, groups);
+  auto head = builder.GetInsertBlock();
+  auto loop = llvm::BasicBlock::Create(context, "so_before", function);
+  auto done = llvm::BasicBlock::Create(context, "so_summed", function);
+  builder.CreateCondBr(builder.CreateICmpULT(thread, items), loop, done);
+  builder.SetInsertPoint(loop);
+  auto g = builder.CreatePHI(types._int, 2);
+  g->addIncoming(thread, head);
+  llvm::PHINode *sums[4];
+  pvalue next_sums[4];
+  for (uint32_t s = 0; s < 4; s++) {
+    sums[s] = builder.CreatePHI(types._long, 2);
+    sums[s]->addIncoming(builder.getInt64(0), head);
+  }
+  // the first items are the blocks before the group's, the rest its block's groups before it
+  auto item = builder.CreateSelect(
+      builder.CreateICmpULT(g, blocks_before), builder.CreateAdd(blocks, builder.CreateMul(g, builder.getInt32(4))),
+      builder.CreateAdd(
+          builder.getInt32(kStreamOutputTotals),
+          builder.CreateMul(builder.CreateAdd(block_start, builder.CreateSub(g, blocks_before)), builder.getInt32(4))
+      )
+  );
+  for (uint32_t s = 0; s < 4; s++)
+    next_sums[s] = builder.CreateAdd(
+        sums[s], builder.CreateZExt(
+                     builder.CreateLoad(types._int, builder.CreateGEP(types._int, scratch, {builder.CreateAdd(item, builder.getInt32(s))})),
+                     types._long
+                 )
+    );
+  auto next_g = builder.CreateAdd(g, builder.getInt32(threads));
+  g->addIncoming(next_g, loop);
+  for (uint32_t s = 0; s < 4; s++)
+    sums[s]->addIncoming(next_sums[s], loop);
+  builder.CreateCondBr(builder.CreateICmpULT(next_g, items), loop, done);
+  builder.SetInsertPoint(done);
+  // Metal sums 32-bit values over a SIMD group: pieces small enough that every thread's fit one sum
+  uint32_t bits = 32 - std::bit_width(threads - 1);
+  std::array<pvalue, 4> before;
+  for (uint32_t s = 0; s < 4; s++) {
+    auto partial = builder.CreatePHI(types._long, 2);
+    partial->addIncoming(builder.getInt64(0), head);
+    partial->addIncoming(next_sums[s], loop);
+    before[s] = partial;
+  }
+  for (uint32_t s = 0; s < 4; s++) {
+    auto partial = before[s];
+    before[s] = builder.getInt64(0);
+    for (uint32_t shift = 0; shift < 64; shift += bits) {
+      auto piece = builder.CreateTrunc(builder.CreateAnd(builder.CreateLShr(partial, shift), (1ull << bits) - 1), types._int);
+      before[s] = builder.CreateAdd(
+          before[s], builder.CreateShl(builder.CreateZExt(simd_sum(builder, module, piece), types._long), shift)
+      );
+    }
+  }
+  return before;
+}
+
+// the sum over a threadgroup of 32 threads, one SIMD group (`thread` this one's index), of entry(j) for each j below
+// `count`, each thread taking every 32nd from its own
+static pvalue
+simd_group_sum(
+    llvm::IRBuilder<> &builder, llvm::Module &module, pvalue thread, pvalue count, const std::function<pvalue(pvalue)> &entry
+) {
+  auto &context = builder.getContext();
+  auto function = builder.GetInsertBlock()->getParent();
+  auto head = builder.GetInsertBlock();
+  auto loop = llvm::BasicBlock::Create(context, "so_sum", function);
+  auto done = llvm::BasicBlock::Create(context, "so_summed", function);
+  builder.CreateCondBr(builder.CreateICmpULT(thread, count), loop, done);
+  builder.SetInsertPoint(loop);
+  auto j = builder.CreatePHI(builder.getInt32Ty(), 2), sum = builder.CreatePHI(builder.getInt32Ty(), 2);
+  j->addIncoming(thread, head);
+  sum->addIncoming(builder.getInt32(0), head);
+  auto next_sum = builder.CreateAdd(sum, entry(j)), next_j = builder.CreateAdd(j, builder.getInt32(32));
+  auto latch = builder.GetInsertBlock();
+  j->addIncoming(next_j, latch);
+  sum->addIncoming(next_sum, latch);
+  builder.CreateCondBr(builder.CreateICmpULT(next_j, count), loop, done);
+  builder.SetInsertPoint(done);
+  auto partial = builder.CreatePHI(builder.getInt32Ty(), 2);
+  partial->addIncoming(builder.getInt32(0), head);
+  partial->addIncoming(next_sum, latch);
+  return simd_sum(builder, module, partial);
+}
+
+// stream output after a tessellator keeps, past the totals, each object threadgroup's counts
+// (tessellation_stream_output_counts): first every group's workloads' totals, then with a geometry shader every
+// group's invocations' counts, `invocations` a workload
+struct TessellationCounts {
+  llvm::IRBuilder<> &builder;
+  pvalue counts, groups, group;
+  uint32_t workloads, invocations;
+  // where stream s's count of the group's workload `w` is, and of its invocation `i`, in 32-bit words
+  pvalue workload(pvalue w, uint32_t s) const {
+    auto at = builder.CreateAdd(builder.CreateMul(group, builder.getInt32(workloads)), w);
+    return builder.CreateAdd(counts, builder.CreateAdd(builder.CreateMul(at, builder.getInt32(4)), builder.getInt32(s)));
+  }
+  pvalue invocation(pvalue w, pvalue i, uint32_t s) const {
+    auto at = builder.CreateAdd(
+        builder.CreateMul(groups, builder.getInt32(workloads)),
+        builder.CreateAdd(
+            builder.CreateMul(builder.CreateAdd(builder.CreateMul(group, builder.getInt32(workloads)), w), builder.getInt32(invocations)), i
+        )
+    );
+    return builder.CreateAdd(counts, builder.CreateAdd(builder.CreateMul(at, builder.getInt32(4)), builder.getInt32(s)));
+  }
+};
+
+// the workloads of an object threadgroup's patches, and the most primitives one has (a workload's primitives do not
+// outnumber its vertices)
+static std::pair<uint32_t, uint32_t>
+tessellation_workloads(SM50ShaderInternal *pHullStage, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs) {
+  uint32_t factor = get_final_maxtessfactor(pHullStage, pArgs).second;
+  uint32_t patch_per_group = next_pow2(32 / next_pow2(pHullStage->hull_maximum_threads_per_patch));
+  return {get_max_potential_workload_count(factor, pHullStage->tessellation_domain, pHullStage->tessellation_partition) *
+              patch_per_group,
+          get_max_workload_vertices(factor, pHullStage->tessellation_domain)};
+}
+
+// stream s's primitives that fit in every one of its buffers past where the draw started (`snapshot`), none when one
+// is unbound
+static pvalue
+stream_output_limit(
+    llvm::IRBuilder<> &builder, SM50_SHADER_STREAM_OUTPUT_DATA *so, uint32_t slots, const std::function<pvalue(uint32_t, int32_t)> &field,
+    const pvalue (&snapshot)[4], uint32_t vertices
+) {
+  pvalue limit = builder.getInt64(~0ull);
+  for (uint32_t b = 0; b < 4; b++) {
+    if (!(slots & (1u << b)))
+      continue;
+    auto size = field(1, b);
+    auto room = builder.CreateSub(size, builder.CreateSelect(builder.CreateICmpULT(snapshot[b], size), snapshot[b], size));
+    auto fit = builder.CreateUDiv(room, builder.getInt64(uint64_t(vertices) * so->strides[b]));
+    fit = builder.CreateSelect(builder.CreateICmpEQ(field(0, b), builder.getInt64(0)), builder.getInt64(0), fit);
+    limit = builder.CreateSelect(builder.CreateICmpULT(fit, limit), fit, limit);
+  }
+  return limit;
+}
+
+std::pair<pvalue, std::array<pvalue, 4>>
+tessellation_stream_output_object(
+    llvm::IRBuilder<> &builder, air::AirType &types, llvm::Module &module, SM50_SHADER_STREAM_OUTPUT_DATA *so,
+    pvalue targets, pvalue patches, pvalue instance, pvalue thread, pvalue first_part, uint32_t vertices
+) {
+  auto &context = builder.getContext();
+  auto function = builder.GetInsertBlock()->getParent();
+  auto targets_type = stream_output_targets_type(context, types);
+  auto field = [&](uint32_t f, int32_t i = -1) -> pvalue {
+    auto ptr = builder.CreateStructGEP(targets_type, targets, f);
+    if (i >= 0)
+      ptr = builder.CreateConstInBoundsGEP2_32(targets_type->getElementType(f), ptr, 0, i);
+    return builder.CreateLoad(i < 0 ? targets_type->getElementType(f) : types._long, ptr);
+  };
+  auto device = [&](llvm::Type *ty, pvalue address) {
+    return builder.CreateIntToPtr(address, ty->getPointerTo((uint32_t)air::AddressSpace::device));
+  };
+  auto when = [&](pvalue cond, auto then) {
+    auto yes = llvm::BasicBlock::Create(context, "so_yes", function), no = llvm::BasicBlock::Create(context, "so_no", function);
+    builder.CreateCondBr(cond, yes, no);
+    builder.SetInsertPoint(yes);
+    then();
+    builder.CreateBr(no);
+    builder.SetInsertPoint(no);
+  };
+  uint32_t slots[4] = {}, all_slots = 0;
+  for (uint32_t i = 0; i < so->num_elements; i++)
+    slots[so->elements[i].stream] |= 1u << so->elements[i].output_slot;
+  for (auto s : slots)
+    all_slots |= s;
+  auto zero = builder.getInt32(0);
+  auto group = builder.CreateAdd(builder.CreateMul(instance, field(4)), patches);
+  auto groups = builder.CreateMul(field(4), field(5));
+  auto lead = builder.CreateAnd(first_part, builder.CreateICmpEQ(thread, zero));
+  auto scratch = device(types._int, field(3));
+  auto snapshots = device(types._long, field(3));
+  std::array<pvalue, 4> before;
+  before.fill(builder.getInt64(0));
+  if (so->counting) {
+    when(builder.CreateAnd(lead, builder.CreateICmpEQ(group, zero)), [&] {
+      for (uint32_t b = 0; b < 4; b++)
+        if (all_slots & (1u << b))
+          when(builder.CreateICmpNE(field(2, b), builder.getInt64(0)), [&] {
+            builder.CreateStore(
+                builder.CreateZExt(builder.CreateLoad(types._int, device(types._int, field(2, b))), types._long),
+                builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b)
+            );
+          });
+    });
+    return {group, before};
+  }
+  before = stream_output_groups_before(builder, module, types, scratch, group, groups, thread, 32);
+  when(builder.CreateAnd(lead, builder.CreateICmpEQ(builder.CreateAdd(group, builder.getInt32(1)), groups)), [&] {
+    pvalue snapshot[4], written[4] = {};
+    for (uint32_t b = 0; b < 4; b++)
+      snapshot[b] = builder.CreateLoad(types._long, builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
+    for (uint32_t s = 0; s < 4; s++) {
+      if (!slots[s])
+        continue;
+      auto own = builder.CreateLoad(
+          types._int, builder.CreateGEP(
+                          types._int, scratch,
+                          {builder.CreateAdd(
+                              builder.getInt32(kStreamOutputTotals),
+                              builder.CreateAdd(builder.CreateMul(group, builder.getInt32(4)), builder.getInt32(s))
+                          )}
+                      )
+      );
+      auto total = builder.CreateAdd(before[s], builder.CreateZExt(own, types._long));
+      auto limit = stream_output_limit(builder, so, slots[s], field, snapshot, vertices);
+      written[s] = builder.CreateSelect(builder.CreateICmpULT(total, limit), total, limit);
+      add_stream_output_statistics(builder, types, field(6, s), written[s], total);
+    }
+    for (uint32_t b = 0; b < 4; b++) {
+      uint32_t stream = 4;
+      for (uint32_t s = 0; s < 4; s++)
+        if (slots[s] & (1u << b))
+          stream = s;
+      if (stream == 4)
+        continue;
+      // a filled size is 32 bits (Microsoft Learn, Stream Output Counters), 4-byte aligned
+      when(builder.CreateICmpNE(field(2, b), builder.getInt64(0)), [&] {
+        builder.CreateStore(
+            builder.CreateTrunc(
+                builder.CreateAdd(snapshot[b], builder.CreateMul(written[stream], builder.getInt64(uint64_t(vertices) * so->strides[b]))),
+                types._int
+            ),
+            device(types._int, field(2, b))
+        );
+      });
+    }
+  });
+  return {group, before};
 }
 
 // conservative rasterization of a triangle with corners at `clip`, through the viewport `viewport_index` of
@@ -542,6 +802,52 @@ conservative_point(
   }
 }
 
+// dz/dx and dz/dy of the window-space plane through three clip-space vertices (D3D11.3 15.10). order does not matter:
+// swapping two vertices negates both the area and the gradients
+template <typename Air>
+static llvm::Value *
+triangle_plane_slope(llvm::IRBuilder<> &builder, Air &air, air::AirType &types, llvm::Value *scale, llvm::Value *a,
+                      llvm::Value *b, llvm::Value *c) {
+  llvm::IRBuilder<>::FastMathFlagGuard guard(builder);
+  llvm::FastMathFlags precise;
+  builder.setFastMathFlags(precise);
+  auto at = [&](llvm::Value *v, uint64_t i) { return builder.CreateExtractElement(v, i); };
+  auto load = [&](uint32_t i) {
+    return builder.CreateLoad(types._float, builder.CreateConstInBoundsGEP1_32(types._float, scale, i));
+  };
+  auto width = load(1), height = load(2);
+  auto vp = [&](uint32_t i) { return load(SM50_RASTER_SCALE_VIEWPORT + i); };
+  auto window = [&](llvm::Value *clip, uint32_t axis) -> llvm::Value * {
+    auto ndc = builder.CreateFDiv(at(clip, axis), at(clip, 3));
+    if (axis == 2)
+      return builder.CreateFAdd(vp(2), builder.CreateFMul(ndc, builder.CreateFSub(vp(3), vp(2))));
+    if (axis == 0)
+      return builder.CreateFAdd(
+          builder.CreateFMul(builder.CreateFAdd(ndc, air.getFloat(1)), builder.CreateFMul(width, air.getFloat(0.5f))), vp(0)
+      );
+    return builder.CreateFAdd(
+        builder.CreateFMul(builder.CreateFSub(air.getFloat(1), ndc), builder.CreateFMul(height, air.getFloat(0.5f))), vp(1)
+    );
+  };
+  llvm::Value *clips[3] = {a, b, c}, *p[3][3];
+  for (uint32_t k = 0; k < 3; k++)
+    for (uint32_t axis = 0; axis < 3; axis++)
+      p[k][axis] = window(clips[k], axis);
+  auto sub = [&](llvm::Value *u, llvm::Value *v) { return builder.CreateFSub(u, v); };
+  auto area = builder.CreateFSub(builder.CreateFMul(sub(p[1][0], p[0][0]), sub(p[2][1], p[0][1])),
+                                 builder.CreateFMul(sub(p[1][1], p[0][1]), sub(p[2][0], p[0][0])));
+  auto over = [&](llvm::Value *num) {
+    return builder.CreateSelect(builder.CreateFCmpOEQ(area, air.getFloat(0)), air.getFloat(0), builder.CreateFDiv(num, area));
+  };
+  auto dzdx = over(builder.CreateFSub(builder.CreateFMul(sub(p[1][2], p[0][2]), sub(p[2][1], p[0][1])),
+                                      builder.CreateFMul(sub(p[2][2], p[0][2]), sub(p[1][1], p[0][1]))));
+  auto dzdy = over(builder.CreateFSub(builder.CreateFMul(sub(p[1][0], p[0][0]), sub(p[2][2], p[0][2])),
+                                      builder.CreateFMul(sub(p[2][0], p[0][0]), sub(p[1][2], p[0][2]))));
+  return builder.CreateInsertElement(
+      builder.CreateInsertElement(llvm::UndefValue::get(types._float2), dzdx, uint64_t(0)), dzdy, uint64_t(1)
+  );
+}
+
 llvm::Error
 convert_dxbc_geometry_shader(
     SM50ShaderInternal *pShaderInternal, const char *name, SM50ShaderInternal *pVertexStage, llvm::LLVMContext &context,
@@ -574,8 +880,6 @@ convert_dxbc_geometry_shader(
   auto rootsig_ds = rootsig;
   if (pHullStage)
     args_get_data<SM50_SHADER_ROOT_SIGNATURE2, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
-  if (pHullStage && so)
-    return llvm::make_error<UnsupportedFeature>("stream output of a tessellated draw");
 
   IREffect prologue([](auto) { return std::monostate(); });
   IRValue epilogue([](struct context ctx) -> pvalue { return nullptr; });
@@ -640,12 +944,20 @@ convert_dxbc_geometry_shader(
 
   // the hull stage's payload has the workloads whose primitives the mesh threadgroups take
   auto tessellation_payload =
-      pHullStage ? tessellation_payload_type(pHullStage, get_final_maxtessfactor(pHullStage, pArgs).second, types, context)
+      pHullStage ? tessellation_payload_type(
+                       pHullStage, get_final_maxtessfactor(pHullStage, pArgs).second, types, context, 0, so != nullptr
+                   )
                  : nullptr;
   uint32_t payload_idx = func_signature.DefineInput(air::InputPayload{
       .size = pHullStage ? (uint32_t)module.getDataLayout().getTypeAllocSize(tessellation_payload)
                          : SM50_GEOMETRY_PAYLOAD_SIZE
   });
+  // aliased and quadrilateral lines are triangles. a strip of n vertices is n - 1 lines, four corners and two
+  // triangles each, and a Metal mesh has at most 256 vertices
+  bool line_quads = pso_data && (pso_data->quad_lines || pso_data->diamond_lines) &&
+                    topology == air::MeshOutputTopology::Line;
+  bool plane_slope = pso_data && pso_data->plane_slope && topology == air::MeshOutputTopology::Triangle;
+  bool line_diamond = line_quads && pso_data->diamond_lines;
   // conservative rasterization of the triangles the shader emits: each one Metal triangle of its own
   // (conservative_triangle), which the pipeline asks for only where they fit (MTL_GEOMETRY_SHADER_REFLECTION). after
   // a tessellator the pipeline's say comes with the tessellator's arguments
@@ -663,10 +975,14 @@ convert_dxbc_geometry_shader(
   // position, its output being 1024 scalars at most (D3D11.3 13.3), as one that only streams out: stream output takes
   // all its vertices, the rasterizer the first 256
   constexpr uint32_t mesh_vertex_limit = 256;
-  uint32_t mesh_vertices = std::min<uint32_t>(max_vertex_out, mesh_vertex_limit);
+  uint32_t line_segments = max_vertex_out > 0 ? uint32_t(max_vertex_out - 1) : 0;
+  uint32_t mesh_vertices = line_quads ? std::min<uint32_t>(line_segments * 4, mesh_vertex_limit)
+                                      : std::min<uint32_t>(max_vertex_out, mesh_vertex_limit);
+  uint32_t mesh_primitives = line_quads ? std::min<uint32_t>(line_segments * 2, mesh_vertex_limit) : mesh_vertices;
   // it's intended to declare a bit more max primitive count
   auto mesh_idx = func_signature.DefineInput(air::InputMesh{
-      conservative ? 3 * triangles : mesh_vertices, conservative ? triangles : mesh_vertices, topology
+      conservative ? 3 * triangles : mesh_vertices, conservative ? triangles : mesh_primitives,
+      line_quads ? air::MeshOutputTopology::Triangle : topology
   });
   uint32_t tg_in_grid_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
   // a tessellated draw's mesh threadgroups have the domain stage's threads, of which the first does the work
@@ -697,6 +1013,21 @@ convert_dxbc_geometry_shader(
         air::OutputClipDistance{.count = pShaderInternal->clip_distance_scalars.size()}
     );
   }
+  // the line's ends in the window, flat, for the pixel shader's diamond-exit test
+  uint32_t gs_line_at = clip_data + (clip_varyings ? uint32_t(pShaderInternal->clip_distance_scalars.size()) : 0);
+  if (line_diamond) {
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_line_a", .type = air::msl_float4, .index = gs_line_at}
+    );
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_line_b", .type = air::msl_float4, .index = gs_line_at + 1}
+    );
+  }
+  uint32_t gs_plane_at = gs_line_at + (line_diamond ? 2 : 0);
+  if (plane_slope)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_plane_slope", .type = air::msl_float2, .index = gs_plane_at}
+    );
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
   if (topology == air::MeshOutputTopology::Point)
     func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
@@ -721,7 +1052,7 @@ convert_dxbc_geometry_shader(
     define_conservative_varyings(func_signature, conservative_at, barycentrics);
   }
 
-  auto raster_scale = DefineRasterScale(func_signature);
+  auto raster_scale = DefineRasterScale(func_signature, line_quads || plane_slope ? SM50_RASTER_SCALE_VIEWPORT_WORDS : 1);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
 
   auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
@@ -850,6 +1181,16 @@ convert_dxbc_geometry_shader(
 
   // what the rasterized stream's emit and cut make of the mesh
   std::function<IREffect()> mesh_emit, mesh_cut;
+  llvm::Value *plane_ring = nullptr;
+  uint32_t plane_position_reg = ~0u;
+  if (plane_slope) {
+    for (auto &element : pShaderInternal->output_signature)
+      if (element.systemValue() == D3D10_SB_NAME_POSITION)
+        plane_position_reg = element.reg();
+    llvm::IRBuilder<>::InsertPointGuard guard(builder);
+    builder.SetInsertPoint(&*function->getEntryBlock().getFirstInsertionPt());
+    plane_ring = builder.CreateAlloca(llvm::ArrayType::get(types._float4, 3));
+  }
   if (topology == air::MeshOutputTopology::Triangle) {
     mesh_emit = [&]() -> IREffect {
       auto current_write_vertex = builder.CreateLoad(types._int, next_write_vertex);
@@ -885,6 +1226,31 @@ convert_dxbc_geometry_shader(
 
       builder.CreateStore(builder.CreateAdd(one_const, current_write_vertex), next_write_vertex);
 
+      // the third vertex completes the triangle. wireframe's slope is that plane, written flat on its vertices
+      if (plane_ring && plane_position_reg != ~0u) {
+        auto registers = llvm::ArrayType::get(types._float4, max_output_register);
+        auto ring_type = llvm::ArrayType::get(types._float4, 3);
+        auto pos = builder.CreateLoad(
+            types._float4, builder.CreateGEP(registers, resource_map.output.ptr_float4,
+                                             {builder.getInt32(0), builder.getInt32(plane_position_reg)})
+        );
+        auto slot = builder.CreateURem(current_write_vertex, builder.getInt32(3));
+        builder.CreateStore(pos, builder.CreateGEP(ring_type, plane_ring, {builder.getInt32(0), slot}));
+        auto write = llvm::BasicBlock::Create(context, "plane_slope", function);
+        auto cont = llvm::BasicBlock::Create(context, "plane_after", function);
+        builder.CreateCondBr(builder.CreateICmpEQ(current_write_vertex, builder.getInt32(2)), write, cont);
+        builder.SetInsertPoint(write);
+        auto corner = [&](uint32_t i) {
+          return builder.CreateLoad(types._float4, builder.CreateConstInBoundsGEP2_32(ring_type, plane_ring, 0, i));
+        };
+        auto gradient = triangle_plane_slope(builder, air, types, function->getArg(raster_scale), corner(0), corner(1), corner(2));
+        auto last = current_vertex_with_offset;
+        for (uint32_t back = 0; back < 3; back++)
+          air.CreateSetMeshVertexData(builder.CreateSub(last, builder.getInt32(back)), builder.getInt32(gs_plane_at), gradient);
+        builder.CreateBr(cont);
+        builder.SetInsertPoint(cont);
+      }
+
       co_return {};
     };
     mesh_cut = [&]() -> IREffect {
@@ -901,6 +1267,242 @@ convert_dxbc_geometry_shader(
       );
       builder.CreateStore(
           builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), add_primitive_count), primitive_count
+      );
+      co_return {};
+    };
+  } else if (line_quads) {
+    // the strip's previous vertex, and the one being emitted: a line is the two of them
+    llvm::Value *prev_regs = nullptr, *curr_regs = nullptr;
+    auto regs_ty = llvm::ArrayType::get(types._int4, std::max(max_output_register, 1u));
+    {
+      llvm::IRBuilder<>::InsertPointGuard guard(builder);
+      builder.SetInsertPoint(&*function->getEntryBlock().getFirstInsertionPt());
+      prev_regs = builder.CreateAlloca(regs_ty, nullptr, "gs_line_prev");
+      curr_regs = builder.CreateAlloca(regs_ty, nullptr, "gs_line_curr");
+    }
+    uint32_t gs_position_reg = ~0u;
+    for (auto &element : pShaderInternal->output_signature)
+      if (element.systemValue() == microsoft::D3D10_SB_NAME_POSITION)
+        gs_position_reg = element.reg();
+    // the closure outlives this block and runs while the bytecode is compiled, so the block's pointers are copied
+    mesh_emit = [&, prev_regs, curr_regs, regs_ty, gs_position_reg]() -> IREffect {
+      auto written = builder.CreateLoad(types._int, next_write_vertex);
+      builder.CreateStore(builder.CreateAdd(written, one_const), next_write_vertex);
+      auto out_at = [&](uint32_t reg) {
+        return builder.CreateGEP(regs_ty, resource_map.output.ptr_int4, {zero_const, builder.getInt32(reg)});
+      };
+      auto saved_at = [&](llvm::Value *regs, uint32_t reg) {
+        return builder.CreateGEP(regs_ty, regs, {zero_const, builder.getInt32(reg)});
+      };
+      for (uint32_t r = 0; r < max_output_register; r++)
+        builder.CreateStore(builder.CreateLoad(types._int4, out_at(r)), saved_at(curr_regs, r));
+      auto expand = llvm::BasicBlock::Create(context, "gs_line_quad", function);
+      auto after = llvm::BasicBlock::Create(context, "gs_line_quad_done", function);
+      builder.CreateCondBr(builder.CreateICmpUGE(written, one_const), expand, after);
+      builder.SetInsertPoint(expand);
+      auto segment = builder.CreateAdd(
+          builder.CreateLShr(builder.CreateLoad(types._int, vertex_offset), 2), builder.CreateSub(written, one_const)
+      );
+      auto base = builder.CreateMul(segment, builder.getInt32(4));
+      auto prim = builder.CreateMul(segment, two_const);
+      auto restore = [&](llvm::Value *regs) {
+        for (uint32_t r = 0; r < max_output_register; r++)
+          builder.CreateStore(builder.CreateLoad(types._int4, saved_at(regs, r)), out_at(r));
+      };
+      auto clip_of = [&](llvm::Value *regs) {
+        pvalue p = llvm::UndefValue::get(types._float4);
+        if (gs_position_reg == ~0u)
+          return p;
+        auto bits = builder.CreateLoad(types._int4, saved_at(regs, gs_position_reg));
+        for (uint32_t c = 0; c < 4; c++)
+          p = builder.CreateInsertElement(p, builder.CreateBitCast(builder.CreateExtractElement(bits, c), types._float), c);
+        return p;
+      };
+      pvalue clip_a = clip_of(prev_regs), clip_b = clip_of(curr_regs);
+      auto comp = [&](pvalue v, uint64_t i) { return builder.CreateExtractElement(v, i); };
+      if (line_diamond && gs_position_reg != ~0u) {
+        pvalue dead = builder.getFalse();
+        auto depth_clip = builder.CreateFCmpONE(
+            builder.CreateLoad(
+                types._float,
+                builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_MESH_ORIGIN)
+            ),
+            air.getFloat(0)
+        );
+        auto plane = [&](auto &&fn, llvm::Value *enabled) {
+          auto da = fn(clip_a), db = fn(clip_b);
+          auto a_out = builder.CreateAnd(enabled, builder.CreateFCmpOLT(da, air.getFloat(0)));
+          auto b_out = builder.CreateAnd(enabled, builder.CreateFCmpOLT(db, air.getFloat(0)));
+          dead = builder.CreateOr(dead, builder.CreateAnd(a_out, b_out));
+          auto t = builder.CreateFDiv(da, builder.CreateFSub(da, db));
+          auto hit = builder.CreateFAdd(
+              clip_a, builder.CreateFMul(builder.CreateVectorSplat(4, t), builder.CreateFSub(clip_b, clip_a))
+          );
+          clip_a = builder.CreateSelect(a_out, hit, clip_a);
+          clip_b = builder.CreateSelect(b_out, hit, clip_b);
+        };
+        auto always = builder.getTrue();
+        plane([&](pvalue v) { return comp(v, 3); }, always);
+        plane([&](pvalue v) { return builder.CreateFAdd(comp(v, 0), comp(v, 3)); }, always);
+        plane([&](pvalue v) { return builder.CreateFSub(comp(v, 3), comp(v, 0)); }, always);
+        plane([&](pvalue v) { return builder.CreateFAdd(comp(v, 1), comp(v, 3)); }, always);
+        plane([&](pvalue v) { return builder.CreateFSub(comp(v, 3), comp(v, 1)); }, always);
+        plane([&](pvalue v) { return comp(v, 2); }, depth_clip);
+        plane([&](pvalue v) { return builder.CreateFSub(comp(v, 3), comp(v, 2)); }, depth_clip);
+        dead = builder.CreateOr(
+            dead, builder.CreateOr(builder.CreateFCmpOLE(comp(clip_a, 3), air.getFloat(0)),
+                                   builder.CreateFCmpOLE(comp(clip_b, 3), air.getFloat(0)))
+        );
+        auto dropped = builder.CreateVectorSplat(4, llvm::ConstantFP::getNaN(types._float));
+        clip_a = builder.CreateSelect(dead, dropped, clip_a);
+        clip_b = builder.CreateSelect(dead, dropped, clip_b);
+      }
+      restore(prev_regs);
+      for (uint32_t k = 0; k < 2; k++) {
+        auto vertex = builder.CreateAdd(base, builder.getInt32(k));
+        MeshOutputContext gs_out_ctx{vertex, prim};
+        for (auto &h : gs_output_handlers)
+          co_yield h(gs_out_ctx);
+        emit_clip_distances(vertex);
+      }
+      restore(curr_regs);
+      for (uint32_t k = 0; k < 2; k++) {
+        auto vertex = builder.CreateAdd(base, builder.getInt32(2 + k));
+        MeshOutputContext gs_out_ctx{vertex, builder.CreateAdd(prim, one_const)};
+        for (auto &h : gs_output_handlers)
+          co_yield h(gs_out_ctx);
+        emit_clip_distances(vertex);
+      }
+      // a cull distance drops the line when both ends are behind it, NaN included (D3D11.3 15.4.2). the strip's
+      // running mask is the previous emit's registers, which this expansion no longer feeds one vertex at a time
+      llvm::Value *line_culled = builder.getFalse();
+      auto culled_end = [&](llvm::Value *regs, const ScalarInfo &distance) {
+        auto word = builder.CreateLoad(types._int4, saved_at(regs, distance.reg));
+        auto f = builder.CreateBitCast(builder.CreateExtractElement(word, uint64_t(distance.component)), types._float);
+        return builder.CreateFCmpULT(f, air.getFloat(0));
+      };
+      for (auto &distance : pShaderInternal->cull_distance_scalars)
+        line_culled = builder.CreateOr(
+            line_culled, builder.CreateAnd(culled_end(prev_regs, distance), culled_end(curr_regs, distance))
+        );
+      llvm::Value *missing = line_culled;
+      if (gs_position_reg != ~0u) {
+        auto at = comp;
+        auto width = builder.CreateLoad(
+            types._float, builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), 1)
+        );
+        auto height = builder.CreateLoad(
+            types._float, builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), 2)
+        );
+        auto sx = builder.CreateFMul(
+            width, builder.CreateFSub(builder.CreateFMul(at(clip_b, 0), at(clip_a, 3)), builder.CreateFMul(at(clip_a, 0), at(clip_b, 3)))
+        );
+        auto sy = builder.CreateFMul(
+            height, builder.CreateFSub(builder.CreateFMul(at(clip_b, 1), at(clip_a, 3)), builder.CreateFMul(at(clip_a, 1), at(clip_b, 3)))
+        );
+        auto length = air.CreateFPUnOp(
+            llvm::air::AIRBuilder::sqrt, builder.CreateFAdd(builder.CreateFMul(sx, sx), builder.CreateFMul(sy, sy)), false
+        );
+        // a line of no length has no quad; dividing by it would feed the rasterizer infinities
+        missing = builder.CreateOr(missing, builder.CreateFCmpULE(length, air.getFloat(0)));
+        auto safe_length = builder.CreateSelect(missing, air.getFloat(1), length);
+        float line_width = line_diamond ? 2.f : 1.4f;
+        auto scale = builder.CreateFDiv(llvm::ConstantFP::get(types._float, line_width), safe_length);
+        auto half = builder.CreateInsertElement(
+            builder.CreateInsertElement(
+                llvm::ConstantAggregateZero::get(types._float4), builder.CreateFDiv(builder.CreateFMul(scale, sy), width), (uint64_t)0
+            ),
+            builder.CreateFNeg(builder.CreateFDiv(builder.CreateFMul(scale, sx), height)), 1
+        );
+        pvalue along = nullptr;
+        if (line_diamond) {
+          auto inv = builder.CreateFDiv(air.getFloat(2), safe_length);
+          along = builder.CreateInsertElement(
+              builder.CreateInsertElement(
+                  llvm::ConstantAggregateZero::get(types._float4), builder.CreateFDiv(builder.CreateFMul(inv, sx), width), (uint64_t)0
+              ),
+              builder.CreateFDiv(builder.CreateFMul(inv, sy), height), 1
+          );
+          auto project = [&](pvalue clipv) {
+            auto cw = at(clipv, 3);
+            auto ndc = [&](uint64_t i) { return builder.CreateFDiv(at(clipv, i), cw); };
+            auto x = builder.CreateFMul(builder.CreateFAdd(ndc(0), air.getFloat(1)), builder.CreateFMul(width, air.getFloat(0.5f)));
+            auto y = builder.CreateFMul(builder.CreateFSub(air.getFloat(1), ndc(1)), builder.CreateFMul(height, air.getFloat(0.5f)));
+            auto grid = air.getFloat(256);
+            auto snap = [&](pvalue v) {
+              return builder.CreateFDiv(
+                  air.CreateFPUnOp(llvm::air::AIRBuilder::rint, builder.CreateFMul(v, grid), false), grid
+              );
+            };
+            auto zmin = builder.CreateLoad(
+                types._float,
+                builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_VIEWPORT + 2)
+            );
+            auto zmax = builder.CreateLoad(
+                types._float,
+                builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_VIEWPORT + 3)
+            );
+            pvalue r = llvm::UndefValue::get(types._float4);
+            r = builder.CreateInsertElement(r, snap(x), (uint64_t)0);
+            r = builder.CreateInsertElement(r, snap(y), (uint64_t)1);
+            r = builder.CreateInsertElement(r, builder.CreateFAdd(zmin, builder.CreateFMul(ndc(2), builder.CreateFSub(zmax, zmin))), (uint64_t)2);
+            return builder.CreateInsertElement(r, builder.CreateFDiv(air.getFloat(1), cw), (uint64_t)3);
+          };
+          auto end_a = project(clip_a), end_b = project(clip_b);
+          for (uint32_t k = 0; k < 4; k++) {
+            auto vertex = builder.CreateAdd(base, builder.getInt32(k));
+            air.CreateSetMeshVertexData(vertex, gs_line_at, end_a);
+            air.CreateSetMeshVertexData(vertex, gs_line_at + 1, end_b);
+          }
+        }
+        for (uint32_t k = 0; k < 4; k++) {
+          auto corner = k / 2 ? clip_b : clip_a;
+          pvalue offset = half;
+          if (along) {
+            auto side = k % 2 ? builder.CreateFNeg(half) : half;
+            auto end = k / 2 ? along : builder.CreateFNeg(along);
+            offset = builder.CreateFAdd(side, end);
+          }
+          offset = builder.CreateFMul(offset, builder.CreateVectorSplat(4, at(corner, 3)));
+          auto position = !along && k % 2 ? builder.CreateFSub(corner, offset) : builder.CreateFAdd(corner, offset);
+          // off the clip volume, so a zero-length line covers nothing even when the mesh has no cull output
+          auto off = llvm::ConstantVector::get(
+              {llvm::ConstantFP::get(types._float, -2.f), llvm::ConstantFP::get(types._float, -2.f),
+               llvm::ConstantFP::get(types._float, 0.f), llvm::ConstantFP::get(types._float, 1.f)}
+          );
+          position = builder.CreateSelect(missing, off, position);
+          air.CreateSetMeshPosition(builder.CreateAdd(base, builder.getInt32(k)), position);
+        }
+      }
+      static constexpr uint32_t quad_indices[] = {0, 2, 1, 1, 2, 3};
+      for (uint32_t i = 0; i < std::size(quad_indices); i++)
+        air.CreateSetMeshIndex(
+            builder.CreateAdd(builder.CreateMul(prim, builder.getInt32(3)), builder.getInt32(i)),
+            builder.CreateAdd(base, builder.getInt32(quad_indices[i]))
+        );
+      if (culls) {
+        air.CreateSetMeshPrimitiveCulled(prim, missing);
+        air.CreateSetMeshPrimitiveCulled(builder.CreateAdd(prim, one_const), missing);
+      }
+      builder.CreateBr(after);
+      builder.SetInsertPoint(after);
+      for (uint32_t r = 0; r < max_output_register; r++)
+        builder.CreateStore(builder.CreateLoad(types._int4, saved_at(curr_regs, r)), saved_at(prev_regs, r));
+      co_return {};
+    };
+    mesh_cut = [&]() -> IREffect {
+      auto written = builder.CreateLoad(types._int, next_write_vertex);
+      builder.CreateStore(zero_const, next_write_vertex);
+      auto lines = builder.CreateSelect(
+          builder.CreateICmpUGT(written, one_const), builder.CreateSub(written, one_const), zero_const
+      );
+      builder.CreateStore(
+          builder.CreateAdd(builder.CreateLoad(types._int, vertex_offset), builder.CreateMul(lines, builder.getInt32(4))),
+          vertex_offset
+      );
+      builder.CreateStore(
+          builder.CreateAdd(builder.CreateLoad(types._int, primitive_count), builder.CreateMul(lines, two_const)),
+          primitive_count
       );
       co_return {};
     };
@@ -1282,8 +1884,17 @@ convert_dxbc_geometry_shader(
   setup_temp_register(shader_info, resource_map, types, module, builder);
   setup_immediate_constant_buffer(shader_info, resource_map, types, module, builder);
 
-  // this invocation's place: draw instance, object threadgroup, primitive, geometry instance
+  // this invocation's place: draw instance, object threadgroup, primitive, geometry instance. after a tessellator:
+  // the hull stage's object threadgroup, then workload, its primitive and geometry instance, as the counts keep them
+  // (TessellationCounts), the invocation counted in its workload
   pvalue so_invocation = nullptr, so_warp = nullptr, so_groups = nullptr, so_counts = nullptr;
+  std::optional<TessellationCounts> tessellation_counts;
+  auto tessellation_field = [&](uint32_t field) {
+    return builder.CreateGEP(
+        tessellation_payload, builder.CreateBitCast(payload, tessellation_payload->getPointerTo(6)),
+        {builder.getInt32(0), builder.getInt32(field)}
+    );
+  };
   if (so) {
     auto targets_type = stream_output_targets_type(context, types);
     auto targets = function->getArg(so_idx);
@@ -1295,17 +1906,29 @@ convert_dxbc_geometry_shader(
     };
     so_scratch = builder.CreateIntToPtr(field(3), types._int->getPointerTo((uint32_t)air::AddressSpace::device));
     auto warps = field(4), instances = field(5);
-    auto instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
-    so_warp = builder.CreateAdd(builder.CreateMul(instance, warps), warp_id);
-    so_invocation = builder.CreateAdd(
-        builder.CreateMul(
-            builder.CreateAdd(builder.CreateMul(so_warp, builder.getInt32(warp_primitive_count)), primitive_id_in_warp),
-            builder.getInt32(pShaderInternal->gs_instance_count)
-        ),
-        resource_map.gs_instance_id
-    );
     so_groups = builder.CreateMul(warps, instances);
     so_counts = stream_output_counts(builder, so_groups);
+    if (pHullStage) {
+      auto [workloads, primitives] = tessellation_workloads(pHullStage, pArgs);
+      so_warp = builder.CreateLoad(types._int, tessellation_field(kTessellationStreamOutputGroup));
+      so_invocation = builder.CreateAdd(
+          builder.CreateMul(primitive_id_in_warp, builder.getInt32(pShaderInternal->gs_instance_count)),
+          resource_map.gs_instance_id
+      );
+      tessellation_counts.emplace(TessellationCounts{
+          builder, so_counts, so_groups, so_warp, workloads, primitives * pShaderInternal->gs_instance_count
+      });
+    } else {
+      auto instance = builder.CreateLoad(types._int, builder.CreateConstInBoundsGEP1_32(types._int, payload, 0));
+      so_warp = builder.CreateAdd(builder.CreateMul(instance, warps), warp_id);
+      so_invocation = builder.CreateAdd(
+          builder.CreateMul(
+              builder.CreateAdd(builder.CreateMul(so_warp, builder.getInt32(warp_primitive_count)), primitive_id_in_warp),
+              builder.getInt32(pShaderInternal->gs_instance_count)
+          ),
+          resource_map.gs_instance_id
+      );
+    }
     auto snapshots = builder.CreateBitCast(so_scratch, types._long->getPointerTo((uint32_t)air::AddressSpace::device));
     for (uint32_t b = 0; b < 4; b++) {
       so_address[b] = field(0, b);
@@ -1334,6 +1957,25 @@ convert_dxbc_geometry_shader(
       }
       // its first primitive: those of the object threadgroups before (the object stage summed them) and of this
       // group's invocations before this one
+      if (tessellation_counts) {
+        // after a tessellator, those of the workloads before this one, then of its invocations before this one: the
+        // threadgroup's threads sum them, the first then going on alone
+        auto before = builder.CreateLoad(
+            types._long, builder.CreateConstInBoundsGEP2_32(
+                             llvm::ArrayType::get(types._long, 4), tessellation_field(kTessellationStreamOutputBefore), 0, s
+                         )
+        );
+        auto thread = builder.CreateExtractElement(function->getArg(thread_idx), 0ull);
+        auto count = [&](pvalue index) { return builder.CreateLoad(types._int, builder.CreateGEP(types._int, so_scratch, {index})); };
+        auto workloads_before = simd_group_sum(builder, module, thread, workload, [&](pvalue w) {
+          return count(tessellation_counts->workload(w, s));
+        });
+        auto invocations_before = simd_group_sum(builder, module, thread, so_invocation, [&](pvalue i) {
+          return count(tessellation_counts->invocation(workload, i, s));
+        });
+        so_base[s] = builder.CreateAdd(before, i64(builder.CreateAdd(workloads_before, invocations_before)));
+        continue;
+      }
       auto before = builder.CreateLoad(
           types._long, builder.CreateBitCast(
                            builder.CreateConstInBoundsGEP1_32(types._int, payload, kPayloadStreamOutputBase + 2 * s),
@@ -1599,9 +2241,32 @@ convert_dxbc_geometry_shader(
     builder.CreateBr(counted);
     builder.SetInsertPoint(counted);
   }
+  // after a tessellator the first pass leaves each invocation's counts, and adds them to its workload's total and
+  // its object threadgroup's; the hull stage's object threadgroups keep the filled sizes
+  // (tessellation_stream_output_object)
+  if (so && tessellation_counts) {
+    auto at = [&](pvalue index) { return builder.CreateGEP(types._int, so_scratch, {index}); };
+    auto group = builder.CreateMul(so_warp, builder.getInt32(4));
+    auto block = builder.CreateMul(builder.CreateLShr(so_warp, kStreamOutputBlockShift), builder.getInt32(4));
+    for (uint32_t s = 0; so->counting && s < 4; s++) {
+      if (so_elements[s].empty())
+        continue;
+      auto count = builder.CreateLoad(types._int, so_count[s]);
+      builder.CreateStore(count, at(tessellation_counts->invocation(workload, so_invocation, s)));
+      air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, at(tessellation_counts->workload(workload, s)), count);
+      air.CreateAtomicRMW(
+          llvm::AtomicRMWInst::Add,
+          at(builder.CreateAdd(builder.getInt32(kStreamOutputTotals), builder.CreateAdd(group, builder.getInt32(s)))), count
+      );
+      air.CreateAtomicRMW(
+          llvm::AtomicRMWInst::Add,
+          at(builder.CreateAdd(stream_output_blocks(builder, so_groups), builder.CreateAdd(block, builder.getInt32(s)))), count
+      );
+    }
+  }
   // the first pass leaves each invocation's counts and each object threadgroup's totals, and the filled sizes as the
   // draw starts; the second pass's last invocation, which knows every stream's total, moves the filled sizes on
-  if (so) {
+  if (so && !tessellation_counts) {
     auto at = [&](pvalue index) { return builder.CreateGEP(types._int, so_scratch, {index}); };
     auto targets_type = stream_output_targets_type(context, types);
     auto filled = [&](uint32_t b) {
@@ -1690,6 +2355,323 @@ convert_dxbc_geometry_shader(
   return llvm::Error::success();
 }
 
+// the mesh stage of a tessellated draw with stream output and no geometry shader. as a geometry shader's after a
+// tessellator, each mesh threadgroup takes one primitive of a workload, whose first thread runs the domain shader at
+// its corners: the counting pass counts it, and the writing pass streams it out after the primitives of the workloads
+// before its own and those before it in its workload, then passes it on to the rasterizer. a patch's primitives so
+// come out in the order the tessellator makes them, the same every time (D3D11.3 11.5: "no explicit order is
+// prescribed")
+llvm::Error
+convert_tessellated_stream_output(
+    SM50ShaderInternal *pDomainStage, SM50ShaderInternal *pHullStage, const char *name, llvm::LLVMContext &context,
+    llvm::Module &module, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
+) {
+  auto func_signature = pDomainStage->func_signature; // copy
+  auto shader_info = &pDomainStage->shader_info;
+  uint32_t max_output_register = pDomainStage->max_output_register;
+  SM50_SHADER_STREAM_OUTPUT_DATA *so = nullptr;
+  args_get_data<SM50_SHADER_STREAM_OUTPUT, SM50_SHADER_STREAM_OUTPUT_DATA>(pArgs, &so);
+  SM50_SHADER_GS_PASS_THROUGH_DATA *gs_passthrough = nullptr;
+  args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(pArgs, &gs_passthrough);
+  SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
+  SM50_SHADER_FLAG shader_flags = {};
+  SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
+  if (args_get_data<SM50_SHADER_COMMON, SM50_SHADER_COMMON_DATA>(pArgs, &sm50_common)) {
+    metal_version = sm50_common->metal_version;
+    shader_flags = sm50_common->flags;
+  }
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+  args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig);
+  auto factor_int = get_final_maxtessfactor(pHullStage, pArgs).second;
+
+  IREffect prologue([](auto) { return std::monostate(); });
+  IRValue epilogue([](struct context ctx) -> pvalue { return nullptr; });
+  io_binding_map resource_map;
+  air::AirType types(context);
+  {
+    SignatureContext sig_ctx(prologue, epilogue, func_signature, resource_map);
+    for (auto &p : pDomainStage->signature_handlers)
+      p(sig_ctx);
+  }
+  auto &ds_output_handlers = pDomainStage->mesh_output_handlers;
+  auto binding_map = rootsig ? setup_binding_rootsig(
+                                   shader_info, func_signature, module, D3D11_SB_DOMAIN_SHADER, rootsig->bytecode,
+                                   rootsig->bytecode_length
+                               )
+                             : setup_binding_table2(shader_info, func_signature, module);
+  if (!binding_map)
+    return llvm::make_error<UnsupportedFeature>("invalid root signature or missing resource binding");
+
+  // every primitive a patch generates carries the patch's SV_PrimitiveID to the pixel shader
+  func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveID{});
+  uint32_t thread_idx = func_signature.DefineInput(air::InputThreadPositionInThreadgroup{});
+  uint32_t tg_idx = func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+  auto payload_type = tessellation_payload_type(pHullStage, factor_int, types, context, 0, true);
+  uint32_t payload_idx = func_signature.DefineInput(
+      air::InputPayload{.size = (uint32_t)module.getDataLayout().getTypeAllocSize(payload_type)}
+  );
+  auto output_primitive = get_output_primitive(pHullStage);
+  uint32_t corners = get_primitive_vertices(pHullStage->tessellator_output_primitive);
+  func_signature.DefineInput(air::InputMesh{
+      corners, 1,
+      corners == 1   ? air::MeshOutputTopology::Point
+      : corners == 2 ? air::MeshOutputTopology::Line
+                     : air::MeshOutputTopology::Triangle
+  });
+  // Metal culls by primitive, where Direct3D discards one whose vertices are all behind a cull distance (D3D11.3
+  // 15.4.2)
+  bool culls = pDomainStage->cull_distance_scalars.size();
+  if (culls)
+    func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
+  // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
+  if (corners == 1)
+    func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
+  // the clip distances, or as varyings after the stage's own
+  bool clip_varyings = gs_passthrough && gs_passthrough->ClipDistanceVaryings;
+  uint32_t clip_data = pDomainStage->num_mesh_vertex_data;
+  for (uint32_t i = 0; clip_varyings && i < pDomainStage->clip_distance_scalars.size(); i++)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = clip_varying_name(i), .type = air::msl_float, .index = clip_data + i}
+    );
+  if (!clip_varyings && pDomainStage->clip_distance_scalars.size() > 0)
+    func_signature.DefineMeshVertexOutput(air::OutputClipDistance{.count = pDomainStage->clip_distance_scalars.size()});
+  uint32_t so_idx = stream_output_input(func_signature, context, types);
+  auto raster_scale = DefineRasterScale(func_signature);
+  auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
+
+  auto entry_bb = llvm::BasicBlock::Create(context, "entry", function);
+  llvm::IRBuilder<> builder(entry_bb);
+  llvm::raw_null_ostream nulldbg{};
+  llvm::air::AIRBuilder air(
+      {
+          .sampleNaNToZero = bool(shader_flags & SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO),
+          .defuseFma = bool(shader_flags & SM50_SHADER_FLAG_DEFUSE_FMA),
+          .noAtomicMinMax64 = bool(shader_flags & SM50_SHADER_FLAG_NO_ATOMIC_MINMAX64),
+          .noCustomBorder = bool(shader_flags & SM50_SHADER_FLAG_NO_CUSTOM_BORDER),
+          .noMinMaxFilter = bool(shader_flags & SM50_SHADER_FLAG_NO_MINMAX_FILTER),
+      },
+      builder, nulldbg
+  );
+  air.RasterScale = function->getArg(raster_scale);
+  setup_metal_version(module, metal_version);
+  setup_temp_register(shader_info, resource_map, types, module, builder);
+  setup_immediate_constant_buffer(shader_info, resource_map, types, module, builder);
+
+  auto zero = builder.getInt32(0), one = builder.getInt32(1);
+  auto payload = builder.CreateBitCast(function->getArg(payload_idx), payload_type->getPointerTo(6));
+  auto payload_field = [&](uint32_t field) {
+    return builder.CreateGEP(payload_type, payload, {zero, builder.getInt32(field)});
+  };
+  // the threadgroup's workload, counted on from the grid's first, and its primitive of it
+  auto tg = function->getArg(tg_idx);
+  auto workload = builder.CreateAdd(builder.CreateExtractElement(tg, 0ull), builder.CreateLoad(types._int, payload_field(4)));
+  auto primitive = builder.CreateExtractElement(tg, 1ull);
+  auto thread = builder.CreateExtractElement(function->getArg(thread_idx), 0ull);
+
+  struct context ctx{
+      .builder = builder,
+      .air = air,
+      .binding = *binding_map,
+      .llvm = context,
+      .module = module,
+      .function = function,
+      .resource = resource_map,
+      .types = types,
+      .pso_sample_mask = 0xffffffff,
+      .shader_type = pDomainStage->shader_type,
+      .metal_version = metal_version,
+      .simd_width = sm50_common ? sm50_common->simd_width : 0,
+  };
+  dxbc::Converter domain(air, ctx, resource_map);
+  auto workloads = setup_domain_stage(pDomainStage, pHullStage, payload_type, function->getArg(payload_idx), workload, ctx);
+
+  auto targets_type = stream_output_targets_type(context, types);
+  auto targets = function->getArg(so_idx);
+  auto field = [&](uint32_t f, int32_t i = -1) -> pvalue {
+    auto ptr = builder.CreateStructGEP(targets_type, targets, f);
+    if (i >= 0)
+      ptr = builder.CreateConstInBoundsGEP2_32(targets_type->getElementType(f), ptr, 0, i);
+    return builder.CreateLoad(i < 0 ? targets_type->getElementType(f) : types._long, ptr);
+  };
+  auto device = [&](llvm::Type *ty, pvalue address) {
+    return builder.CreateIntToPtr(address, ty->getPointerTo((uint32_t)air::AddressSpace::device));
+  };
+  auto scratch = device(types._int, field(3));
+  auto at = [&](pvalue index) { return builder.CreateGEP(types._int, scratch, {index}); };
+  auto groups = builder.CreateMul(field(4), field(5));
+  auto group = builder.CreateLoad(types._int, payload_field(kTessellationStreamOutputGroup));
+  TessellationCounts counts{
+      builder, stream_output_counts(builder, groups), groups, group, tessellation_workloads(pHullStage, pArgs).first, 0
+  };
+  // without a geometry shader there is one stream, stream 0 (D3D11.3 14.1), and a primitive of it is one: the
+  // threadgroup's place in its workload is its primitive's
+  pvalue base = nullptr;
+  if (!so->counting) {
+    auto before = builder.CreateLoad(
+        types._long,
+        builder.CreateConstInBoundsGEP2_32(llvm::ArrayType::get(types._long, 4), payload_field(kTessellationStreamOutputBefore), 0, 0)
+    );
+    auto workloads_before = simd_group_sum(builder, module, thread, workload, [&](pvalue w) {
+      return builder.CreateLoad(types._int, at(counts.workload(w, 0)));
+    });
+    base = builder.CreateAdd(before, builder.CreateZExt(builder.CreateAdd(workloads_before, primitive), types._long));
+  }
+
+  auto first = llvm::BasicBlock::Create(context, "first_thread", function);
+  auto idle = llvm::BasicBlock::Create(context, "idle", function);
+  auto active_bb = llvm::BasicBlock::Create(context, "active", function);
+  auto done = llvm::BasicBlock::Create(context, "done", function);
+  builder.CreateCondBr(builder.CreateICmpEQ(thread, zero), first, idle);
+  builder.SetInsertPoint(idle);
+  builder.CreateRetVoid();
+  builder.SetInsertPoint(first);
+  auto rasterized = builder.CreateAlloca(types._int);
+  builder.CreateStore(zero, rasterized);
+  auto corner_location = [&](pvalue corner) {
+    return domain.DomainGetPrimitiveLocation(workload, primitive, corner, output_primitive, workloads);
+  };
+  builder.CreateCondBr(corner_location(zero).second, active_bb, done);
+  builder.SetInsertPoint(active_bb);
+
+  if (so->counting) {
+    // its workload's total, its object threadgroup's, and its block's
+    air.CreateAtomicRMW(llvm::AtomicRMWInst::Add, at(counts.workload(workload, 0)), one);
+    air.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add, at(builder.CreateAdd(builder.getInt32(kStreamOutputTotals), builder.CreateMul(group, builder.getInt32(4)))),
+        one
+    );
+    air.CreateAtomicRMW(
+        llvm::AtomicRMWInst::Add,
+        at(builder.CreateAdd(
+            stream_output_blocks(builder, groups),
+            builder.CreateMul(builder.CreateLShr(group, kStreamOutputBlockShift), builder.getInt32(4))
+        )),
+        one
+    );
+    builder.CreateBr(done);
+  } else {
+    // the domain shader makes the primitive's vertices, a corner at a time
+    auto registers_type = llvm::ArrayType::get(types._int4, std::max(max_output_register, 1u));
+    auto ring_type = llvm::ArrayType::get(registers_type, corners);
+    pvalue ring;
+    {
+      llvm::IRBuilder<>::InsertPointGuard guard(builder);
+      builder.SetInsertPoint(&*function->getEntryBlock().getFirstInsertionPt());
+      ring = builder.CreateAlloca(ring_type);
+    }
+    auto ring_at = [&](pvalue corner, uint32_t reg) {
+      return builder.CreateGEP(ring_type, ring, {zero, corner, builder.getInt32(reg)});
+    };
+    auto output_at = [&](uint32_t reg) {
+      return builder.CreateGEP(registers_type, resource_map.output.ptr_int4, {zero, builder.getInt32(reg)});
+    };
+    auto head = builder.GetInsertBlock();
+    auto next_corner = llvm::BasicBlock::Create(context, "corner", function, done);
+    auto made = llvm::BasicBlock::Create(context, "corner_made", function, done);
+    auto assembled = llvm::BasicBlock::Create(context, "assembled", function, done);
+    builder.CreateBr(next_corner);
+    builder.SetInsertPoint(next_corner);
+    auto corner = builder.CreatePHI(types._int, 2);
+    corner->addIncoming(zero, head);
+    resource_map.domain = domain_location(corner_location(corner).first, builder, air);
+    auto entry = convert_basicblocks(pDomainStage->entry(), ctx, made);
+    if (auto err = entry.takeError())
+      return err;
+    builder.CreateBr(entry.get());
+    builder.SetInsertPoint(made);
+    for (uint32_t reg = 0; reg < max_output_register; reg++)
+      builder.CreateStore(builder.CreateLoad(types._int4, output_at(reg)), ring_at(corner, reg));
+    auto following = builder.CreateAdd(corner, one);
+    corner->addIncoming(following, builder.GetInsertBlock());
+    builder.CreateCondBr(builder.CreateICmpULT(following, builder.getInt32(corners)), next_corner, assembled);
+    builder.SetInsertPoint(assembled);
+
+    // written unless it would not fit in all the stream's buffers
+    uint32_t slots = 0;
+    for (uint32_t i = 0; i < so->num_elements; i++)
+      if (!so->elements[i].stream)
+        slots |= 1u << so->elements[i].output_slot;
+    pvalue snapshot[4];
+    auto snapshots = device(types._long, field(3));
+    for (uint32_t b = 0; b < 4; b++)
+      snapshot[b] = builder.CreateLoad(types._long, builder.CreateConstInBoundsGEP1_32(types._long, snapshots, b));
+    auto limit = stream_output_limit(builder, so, slots, field, snapshot, corners);
+    auto write = llvm::BasicBlock::Create(context, "so_write", function, done);
+    auto written = llvm::BasicBlock::Create(context, "so_written", function, done);
+    builder.CreateCondBr(builder.CreateICmpULT(base, limit), write, written);
+    builder.SetInsertPoint(write);
+    for (uint32_t j = 0; j < corners; j++)
+      for (uint32_t i = 0; i < so->num_elements; i++) {
+        auto &e = so->elements[i];
+        if (e.reg_id == ~0u || e.stream)
+          continue;
+        auto value = builder.CreateExtractElement(builder.CreateLoad(types._int4, ring_at(builder.getInt32(j), e.reg_id)), uint64_t(e.component));
+        auto vertex = builder.CreateAdd(builder.CreateMul(base, builder.getInt64(corners)), builder.getInt64(j));
+        auto address = builder.CreateAdd(
+            builder.CreateAdd(field(0, e.output_slot), snapshot[e.output_slot]),
+            builder.CreateAdd(builder.CreateMul(vertex, builder.getInt64(so->strides[e.output_slot])), builder.getInt64(e.offset))
+        );
+        builder.CreateStore(value, device(types._int, address));
+      }
+    builder.CreateBr(written);
+    builder.SetInsertPoint(written);
+
+    if (so->rasterized_stream == 0) {
+      auto real = [&](pvalue bits) { return builder.CreateBitCast(bits, types._float); };
+      for (uint32_t j = 0; j < corners; j++) {
+        auto vertex = builder.getInt32(j);
+        for (uint32_t reg = 0; reg < max_output_register; reg++)
+          builder.CreateStore(builder.CreateLoad(types._int4, ring_at(vertex, reg)), output_at(reg));
+        MeshOutputContext out{vertex, zero};
+        for (auto &h : ds_output_handlers)
+          if (auto err = h(out).build(ctx).takeError())
+            return err;
+        for (auto x : llvm::enumerate(pDomainStage->clip_distance_scalars)) {
+          if (x.value().reg >= max_output_register)
+            continue;
+          auto distance = real(builder.CreateExtractElement(
+              builder.CreateLoad(types._int4, ring_at(vertex, x.value().reg)), uint64_t(x.value().component)
+          ));
+          if (clip_varyings)
+            air.CreateSetMeshVertexData(vertex, clip_data + x.index(), distance);
+          else
+            air.CreateSetMeshClipDistance(vertex, builder.getInt32(x.index()), distance);
+        }
+        if (corners == 1)
+          air.CreateSetMeshPointSize(vertex, air.getFloat(1.0));
+        air.CreateSetMeshIndex(vertex, vertex);
+      }
+      // culled by a distance every corner is behind: negative, or NaN
+      if (culls) {
+        pvalue culled = builder.getFalse();
+        for (auto &distance : pDomainStage->cull_distance_scalars) {
+          pvalue behind = builder.getTrue();
+          for (uint32_t j = 0; j < corners; j++)
+            behind = builder.CreateAnd(
+                behind, builder.CreateFCmpULT(
+                            real(builder.CreateExtractElement(
+                                builder.CreateLoad(types._int4, ring_at(builder.getInt32(j), distance.reg)), uint64_t(distance.component)
+                            )),
+                            llvm::ConstantFP::get(types._float, 0)
+                        )
+            );
+          culled = builder.CreateOr(culled, behind);
+        }
+        air.CreateSetMeshPrimitiveCulled(zero, culled);
+      }
+      air.CreateSetMeshPrimitiveID(zero, resource_map.patch_id);
+      builder.CreateStore(one, rasterized);
+    }
+    builder.CreateBr(done);
+  }
+
+  builder.SetInsertPoint(done);
+  air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, rasterized));
+  builder.CreateRetVoid();
+  module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
+  return llvm::Error::success();
+}
+
 // the mesh stage of a pipeline with stream output and no geometry shader, which gets no threadgroups: its payload is
 // the object stage's (SM50StreamOutputDirect)
 llvm::Error
@@ -1775,7 +2757,10 @@ convert_pass_through_geometry_shader(
   // a quadrilateral line is a rectangle 1.4 pixels wide, two triangles whose corners take their end's attributes
   // (D3D11.3 3.4.5): what Metal's own lines are not. conservative rasterization of triangles: each the triangle
   // conservative_triangle makes of it
-  bool quads = pso_data->quad_lines && own.count == 2, conservative = pso_data->conservative && own.count == 3;
+  bool diamond = pso_data->diamond_lines && own.count == 2;
+  bool quads = (pso_data->quad_lines || diamond) && own.count == 2, conservative = pso_data->conservative && own.count == 3;
+  bool depth_max = pso_data->depth_max && own.count == 3;
+  bool plane_slope = pso_data->plane_slope && own.count == 3;
   // or of one raster sample, the fan of its hull, whose vertices all take the first corner's flat inputs
   bool hull = conservative && pso_data->conservative_hull;
   uint32_t corners = quads ? 4 : hull ? SM50_CONSERVATIVE_HULL_POINTS : own.count,
@@ -1856,6 +2841,26 @@ convert_pass_through_geometry_shader(
     );
   if (pVertexStage->cull_distance_scalars.size() || conservative)
     func_signature.DefineMeshPrimitiveOutput(air::OutputPrimitiveCulled{});
+  // the line's ends in the window, flat, so the pixel shader can apply the diamond-exit rule
+  uint32_t line_at = culls_at + (cull_varyings ? pVertexStage->cull_distance_scalars.size() : 0);
+  if (diamond) {
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_line_a", .type = air::msl_float4, .index = line_at}
+    );
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_line_b", .type = air::msl_float4, .index = line_at + 1}
+    );
+  }
+  uint32_t depth_at = line_at + (diamond ? 2 : 0);
+  if (depth_max)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_depth_max", .type = air::msl_float, .index = depth_at}
+    );
+  uint32_t plane_at = depth_at + (depth_max ? 1 : 0);
+  if (plane_slope)
+    func_signature.DefineMeshVertexOutput(
+        air::OutputMeshData{.user = "mullion_plane_slope", .type = air::msl_float2, .index = plane_at}
+    );
   // Metal's points have a size to be given, Direct3D's are a pixel wide (D3D11.3 3.4.6)
   if (own.count == 1)
     func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
@@ -1875,7 +2880,7 @@ convert_pass_through_geometry_shader(
     define_conservative_varyings(func_signature, conservative_at, pso_data->barycentrics, !hull || pso_data->conservative_inner);
   }
 
-  auto raster_scale = DefineRasterScale(func_signature);
+  auto raster_scale = DefineRasterScale(func_signature, quads || depth_max || plane_slope ? SM50_RASTER_SCALE_VIEWPORT_WORDS : 1);
   auto [function, function_metadata] = func_signature.CreateFunction(name, context, module, 0, false);
   auto entry = llvm::BasicBlock::Create(context, "entry", function);
   auto active = llvm::BasicBlock::Create(context, "active", function);
@@ -1946,10 +2951,46 @@ convert_pass_through_geometry_shader(
   // normal in pixels of the viewport (width and height in the raster scale buffer) is then
   // 0.7 (H dy, W dx) / |(W dx, H dy)| / (W/2, -H/2). a line of no length has no rectangle, and its NaN corners are
   // discarded
-  pvalue half_width = nullptr;
+  pvalue half_width = nullptr, along = nullptr, line_end[2] = {};
   if (quads && clip[0]) {
-    auto a = clip[0], b = clip[1];
     auto at = [&](pvalue v, uint32_t i) { return builder.CreateExtractElement(v, i); };
+    // an aliased line is clipped as a segment before the diamond test. a quadrilateral line keeps letting Metal clip
+    if (diamond) {
+      pvalue dead = builder.getFalse();
+      auto depth_clip = builder.CreateFCmpONE(
+          builder.CreateLoad(
+              types._float,
+              builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_MESH_ORIGIN)
+          ),
+          air.getFloat(0)
+      );
+      auto plane = [&](auto &&fn, llvm::Value *enabled) {
+        auto da = fn(clip[0]), db = fn(clip[1]);
+        auto a_out = builder.CreateAnd(enabled, builder.CreateFCmpOLT(da, air.getFloat(0)));
+        auto b_out = builder.CreateAnd(enabled, builder.CreateFCmpOLT(db, air.getFloat(0)));
+        dead = builder.CreateOr(dead, builder.CreateAnd(a_out, b_out));
+        auto t = builder.CreateFDiv(da, builder.CreateFSub(da, db));
+        auto hit = builder.CreateFAdd(
+            clip[0], builder.CreateFMul(builder.CreateVectorSplat(4, t), builder.CreateFSub(clip[1], clip[0]))
+        );
+        clip[0] = builder.CreateSelect(a_out, hit, clip[0]);
+        clip[1] = builder.CreateSelect(b_out, hit, clip[1]);
+      };
+      auto always = builder.getTrue();
+      plane([&](pvalue v) { return at(v, 3); }, always);
+      plane([&](pvalue v) { return builder.CreateFAdd(at(v, 0), at(v, 3)); }, always);
+      plane([&](pvalue v) { return builder.CreateFSub(at(v, 3), at(v, 0)); }, always);
+      plane([&](pvalue v) { return builder.CreateFAdd(at(v, 1), at(v, 3)); }, always);
+      plane([&](pvalue v) { return builder.CreateFSub(at(v, 3), at(v, 1)); }, always);
+      plane([&](pvalue v) { return at(v, 2); }, depth_clip);
+      plane([&](pvalue v) { return builder.CreateFSub(at(v, 3), at(v, 2)); }, depth_clip);
+      dead = builder.CreateOr(dead, builder.CreateOr(builder.CreateFCmpOLE(at(clip[0], 3), air.getFloat(0)),
+                                                     builder.CreateFCmpOLE(at(clip[1], 3), air.getFloat(0))));
+      auto dropped = builder.CreateVectorSplat(4, llvm::ConstantFP::getNaN(types._float));
+      clip[0] = builder.CreateSelect(dead, dropped, clip[0]);
+      clip[1] = builder.CreateSelect(dead, dropped, clip[1]);
+    }
+    auto a = clip[0], b = clip[1];
     auto chosen_viewport = viewport();
     auto size = [&](uint32_t i) {
       auto index = builder.CreateAdd(builder.CreateShl(chosen_viewport, 1), builder.getInt32(1 + i));
@@ -1958,15 +2999,53 @@ convert_pass_through_geometry_shader(
     auto w = size(0), h = size(1);
     auto sx = builder.CreateFMul(w, builder.CreateFSub(builder.CreateFMul(at(b, 0), at(a, 3)), builder.CreateFMul(at(a, 0), at(b, 3))));
     auto sy = builder.CreateFMul(h, builder.CreateFSub(builder.CreateFMul(at(b, 1), at(a, 3)), builder.CreateFMul(at(a, 1), at(b, 3))));
-    constexpr float line_width = 1.4f;
-    auto scale = builder.CreateFDiv(
-        llvm::ConstantFP::get(types._float, line_width),
-        air.CreateFPUnOp(llvm::air::AIRBuilder::sqrt, builder.CreateFAdd(builder.CreateFMul(sx, sx), builder.CreateFMul(sy, sy)), false)
+    // an aliased line's quad is two pixels wide and a pixel past each end, so the diamond is inside it
+    float line_width = diamond ? 2.f : 1.4f;
+    auto length = air.CreateFPUnOp(
+        llvm::air::AIRBuilder::sqrt, builder.CreateFAdd(builder.CreateFMul(sx, sx), builder.CreateFMul(sy, sy)), false
     );
+    auto scale = builder.CreateFDiv(llvm::ConstantFP::get(types._float, line_width), length);
     half_width = builder.CreateInsertElement(
         builder.CreateInsertElement(llvm::ConstantAggregateZero::get(types._float4), builder.CreateFDiv(builder.CreateFMul(scale, sy), w), (uint64_t)0),
         builder.CreateFNeg(builder.CreateFDiv(builder.CreateFMul(scale, sx), h)), 1
     );
+    if (diamond) {
+      auto inv = builder.CreateFDiv(air.getFloat(2), length);
+      along = builder.CreateInsertElement(
+          builder.CreateInsertElement(
+              llvm::ConstantAggregateZero::get(types._float4), builder.CreateFDiv(builder.CreateFMul(inv, sx), w), (uint64_t)0
+          ),
+          builder.CreateFDiv(builder.CreateFMul(inv, sy), h), 1
+      );
+      auto vpword = [&](uint32_t i) {
+        auto index = builder.CreateAdd(
+            builder.CreateMul(chosen_viewport, builder.getInt32(4)), builder.getInt32(SM50_RASTER_SCALE_VIEWPORT + i)
+        );
+        return builder.CreateLoad(types._float, builder.CreateGEP(types._float, function->getArg(raster_scale), index));
+      };
+      auto project = [&](pvalue clipv) {
+        auto cw = at(clipv, 3);
+        auto ndc = [&](uint32_t i) { return builder.CreateFDiv(at(clipv, i), cw); };
+        auto x = builder.CreateFAdd(
+            builder.CreateFMul(builder.CreateFAdd(ndc(0), air.getFloat(1)), builder.CreateFMul(w, air.getFloat(0.5f))), vpword(0)
+        );
+        auto y = builder.CreateFAdd(
+            builder.CreateFMul(builder.CreateFSub(air.getFloat(1), ndc(1)), builder.CreateFMul(h, air.getFloat(0.5f))), vpword(1)
+        );
+        auto grid = air.getFloat(256);
+        auto snap = [&](pvalue v) {
+          return builder.CreateFDiv(air.CreateFPUnOp(llvm::air::AIRBuilder::rint, builder.CreateFMul(v, grid), false), grid);
+        };
+        auto z = builder.CreateFAdd(vpword(2), builder.CreateFMul(ndc(2), builder.CreateFSub(vpword(3), vpword(2))));
+        pvalue r = llvm::UndefValue::get(types._float4);
+        r = builder.CreateInsertElement(r, snap(x), (uint64_t)0);
+        r = builder.CreateInsertElement(r, snap(y), (uint64_t)1);
+        r = builder.CreateInsertElement(r, z, (uint64_t)2);
+        return builder.CreateInsertElement(r, builder.CreateFDiv(air.getFloat(1), cw), (uint64_t)3);
+      };
+      line_end[0] = project(a);
+      line_end[1] = project(b);
+    }
   }
   // what of each of the primitive's corners each of a triangle's vertices has: its own corner's, or for a conservative
   // rasterizer's triangle what conservative_triangle finds there
@@ -1993,16 +3072,51 @@ convert_pass_through_geometry_shader(
     }
     return builder.CreateFDiv(value, triangle->sum[j]);
   };
+  // the greatest |window z| of the triangle, flat: float depth bias's unit (D3D11.3 15.10)
+  pvalue depth_peak = nullptr;
+  if (depth_max && clip[0]) {
+    auto zmin = builder.CreateLoad(
+        types._float, builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_VIEWPORT + 2)
+    );
+    auto zmax = builder.CreateLoad(
+        types._float, builder.CreateConstInBoundsGEP1_32(types._float, function->getArg(raster_scale), SM50_RASTER_SCALE_VIEWPORT + 3)
+    );
+    depth_peak = air.getFloat(0);
+    for (uint32_t k = 0; k < 3; k++) {
+      auto cw = builder.CreateExtractElement(clip[k], (uint64_t)3);
+      auto ndc = builder.CreateFDiv(builder.CreateExtractElement(clip[k], (uint64_t)2), cw);
+      auto z = builder.CreateFAdd(zmin, builder.CreateFMul(ndc, builder.CreateFSub(zmax, zmin)));
+      auto az = air.CreateFPUnOp(llvm::air::AIRBuilder::fabs, z, false);
+      depth_peak = builder.CreateSelect(builder.CreateFCmpOGT(az, depth_peak), az, depth_peak);
+    }
+  }
+  pvalue plane = nullptr;
+  if (plane_slope && clip[0])
+    plane = triangle_plane_slope(builder, air, types, function->getArg(raster_scale), clip[0], clip[1], clip[2]);
   // a quadrilateral's corners are its ends' to either side, the first end's two then the second's
   auto emit = [&](pvalue vertex, uint32_t u) {
     uint32_t corner = quads ? u / 2 : hull ? 0 : u;
     if (clip[corner]) {
       pvalue position = triangle ? grown[u] : clip[corner];
       if (half_width) {
-        auto offset = builder.CreateFMul(half_width, builder.CreateVectorSplat(4, builder.CreateExtractElement(position, 3)));
-        position = u % 2 ? builder.CreateFSub(position, offset) : builder.CreateFAdd(position, offset);
+        pvalue offset = half_width;
+        if (along) {
+          auto side = u % 2 ? builder.CreateFNeg(half_width) : half_width;
+          auto end = u / 2 ? along : builder.CreateFNeg(along);
+          offset = builder.CreateFAdd(side, end);
+        }
+        offset = builder.CreateFMul(offset, builder.CreateVectorSplat(4, builder.CreateExtractElement(position, 3)));
+        position = !along && u % 2 ? builder.CreateFSub(position, offset) : builder.CreateFAdd(position, offset);
       }
       air.CreateSetMeshPosition(vertex, position);
+      if (line_end[0]) {
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(line_at), line_end[0]);
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(line_at + 1), line_end[1]);
+      }
+      if (depth_peak)
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(depth_at), depth_peak);
+      if (plane)
+        air.CreateSetMeshVertexData(vertex, builder.getInt32(plane_at), plane);
     }
     for (auto &v : varyings) {
       bool integer = pVertexStage->register_types(v.reg, RegisterComponentType::Float)[v.component] != RegisterComponentType::Float;
@@ -2989,65 +4103,10 @@ convert_dxbc_vertex_for_geometry_shader(
     };
     auto scratch = builder.CreateIntToPtr(field(3), types._int->getPointerTo((uint32_t)air::AddressSpace::device));
     auto group = builder.CreateAdd(builder.CreateMul(instance_id, field(4)), warp_id);
-    auto blocks_before = builder.CreateLShr(group, kStreamOutputBlockShift);
-    auto block_start = builder.CreateShl(blocks_before, kStreamOutputBlockShift);
-    auto items = builder.CreateAdd(blocks_before, builder.CreateSub(group, block_start));
-    auto blocks = stream_output_blocks(builder, builder.CreateMul(field(4), field(5)));
-    auto head = builder.GetInsertBlock();
-    auto loop = llvm::BasicBlock::Create(context, "so_before", function, dispatch);
-    auto done = llvm::BasicBlock::Create(context, "so_summed", function, dispatch);
-    builder.CreateCondBr(builder.CreateICmpULT(warp_vertex_id, items), loop, done);
-    builder.SetInsertPoint(loop);
-    auto g = builder.CreatePHI(types._int, 2);
-    g->addIncoming(warp_vertex_id, head);
-    llvm::PHINode *sums[4];
-    pvalue next_sums[4];
-    for (uint32_t s = 0; s < 4; s++) {
-      sums[s] = builder.CreatePHI(types._long, 2);
-      sums[s]->addIncoming(builder.getInt64(0), head);
-    }
-    // the first items are the blocks before the group's, the rest its block's groups before it
-    auto item = builder.CreateSelect(
-        builder.CreateICmpULT(g, blocks_before), builder.CreateAdd(blocks, builder.CreateMul(g, builder.getInt32(4))),
-        builder.CreateAdd(
-            builder.getInt32(kStreamOutputTotals),
-            builder.CreateMul(builder.CreateAdd(block_start, builder.CreateSub(g, blocks_before)), builder.getInt32(4))
-        )
+    auto before = stream_output_groups_before(
+        builder, module, types, scratch, group, builder.CreateMul(field(4), field(5)), warp_vertex_id, threads
     );
-    for (uint32_t s = 0; s < 4; s++) {
-      auto sum = sums[s];
-      next_sums[s] = builder.CreateAdd(
-          sum, builder.CreateZExt(
-                   builder.CreateLoad(
-                       types._int, builder.CreateGEP(types._int, scratch, {builder.CreateAdd(item, builder.getInt32(s))})
-                   ),
-                   types._long
-               )
-      );
-    }
-    auto next_g = builder.CreateAdd(g, builder.getInt32(threads));
-    g->addIncoming(next_g, loop);
-    for (uint32_t s = 0; s < 4; s++)
-      sums[s]->addIncoming(next_sums[s], loop);
-    builder.CreateCondBr(builder.CreateICmpULT(next_g, items), loop, done);
-    builder.SetInsertPoint(done);
-    llvm::PHINode *partials[4];
-    for (uint32_t s = 0; s < 4; s++) {
-      partials[s] = builder.CreatePHI(types._long, 2);
-      partials[s]->addIncoming(builder.getInt64(0), head);
-      partials[s]->addIncoming(next_sums[s], loop);
-    }
-    // Metal sums 32-bit values over a SIMD group: pieces small enough that every thread's fit one sum
-    uint32_t bits = 32 - std::bit_width(threads - 1);
-    for (uint32_t s = 0; s < 4; s++) {
-      so_before[s] = builder.getInt64(0);
-      for (uint32_t shift = 0; shift < 64; shift += bits) {
-        auto piece = builder.CreateTrunc(builder.CreateAnd(builder.CreateLShr(partials[s], shift), (1ull << bits) - 1), types._int);
-        so_before[s] = builder.CreateAdd(
-            so_before[s], builder.CreateShl(builder.CreateZExt(simd("air.simd_sum.u.i32", piece), types._long), shift)
-        );
-      }
-    }
+    std::copy(before.begin(), before.end(), so_before);
   }
 
   // TODO: dispatch phase

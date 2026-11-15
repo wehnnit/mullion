@@ -26,9 +26,15 @@ main() {
   ComPtr<IDXGIAdapter1> adapter;
   CHECK(factory->EnumAdapters1(0, &adapter));
   ComPtr<ID3D12Device> device;
-  for (auto level : {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0})
-    if (!device && SUCCEEDED(D3D12CreateDevice(adapter.Get(), level, __uuidof(ID3D12Device), nullptr)))
-      CHECK(D3D12CreateDevice(adapter.Get(), level, IID_PPV_ARGS(&device)));
+  for (auto level : {D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0}) {
+    if (device)
+      break;
+    // the probe answers the refusal E_NOINTERFACE, which is the skip the run names, before the create it repeats
+    // to hold the device
+    if (D3D12CreateDevice(adapter.Get(), level, __uuidof(ID3D12Device), nullptr) == E_NOINTERFACE)
+      return verdict_skipped("this build does not render Direct3D 12 in this process (router.d3d12.bitness = refuse)");
+    CHECK(make_device(adapter.Get(), level, IID_PPV_ARGS(&device)));
+  }
   if (!expect(device != nullptr, "no device at 12_0 or above"))
     return verdict();
   ComPtr<ID3D12DeviceRemovedExtendedData1> dred1;

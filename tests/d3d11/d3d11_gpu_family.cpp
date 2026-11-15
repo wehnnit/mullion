@@ -44,6 +44,9 @@ static const Row rows[] = {
     {"supportsFXTemporalScaler", 7},
     {"supportsFXDenoisedScaler.metal3", 9, 26},
     {"supportsFXDenoisedScaler.metal4", 9, 26},
+    // MetalFX frame interpolation, which the scalers' history feeds: Apple9 and macOS 26, as its scalers are
+    {"supportsFXFrameInterpolator.metal3", 9, 26},
+    {"supportsFXFrameInterpolator.metal4", 9, 26},
     // BC pixel formats, 32-bit float formats' Filter and Resolve, placement sparse textures
     {"supportsBCTextureCompression", 9, 0, true},
     {"supports32BitFloatFiltering", 9, 0, true},
@@ -98,6 +101,68 @@ main() {
   // Query texture LOD: "some GPU devices in the Apple7 family", every one from Apple8. converted shaders query on
   // every GPU, so a GPU that says no is one they do not compile for
   expect(answer("device.supportsQueryTextureLOD") == 1, "the GPU does not query a texture's LOD");
+  // Making one, not just asking whether the device offers it: the capability above is a class method, this is the
+  // descriptor the frame-generation path builds. No scaler, so it interpolates the game's own frames
+  if (answer("supportsFXFrameInterpolator.metal3") == 1) {
+    WMTFXFrameInterpolatorInfo info{};
+    info.color_format = WMTPixelFormatRGBA8Unorm;
+    info.depth_format = WMTPixelFormatDepth32Float;
+    info.motion_format = WMTPixelFormatRG16Float;
+    info.output_format = WMTPixelFormatBGRA8Unorm;
+    info.ui_format = WMTPixelFormatInvalid;
+    info.scaler = 0;
+    info.input_width = 64, info.input_height = 36, info.output_width = 128, info.output_height = 72;
+    obj_handle_t interpolator = device.newFrameInterpolator(info, false);
+    expect(interpolator != 0, "the device offers interpolation but made no interpolator");
+    // Encoding one, not only holding one. This is the call a frame-generation path makes every other frame, and a
+    // configuration Apple's algorithm will not run shows here rather than in the capability answer: the command
+    // buffer either does not complete or comes back with an error
+    if (interpolator) {
+      // 0 is not this device's default: Metal asserts on a maxCommandBufferCount of 0
+      obj_handle_t queue = MTLDevice_newCommandQueue(device.handle, 2);
+      if (expect(queue != 0, "no command queue to interpolate into")) {
+        auto texture = [&](WMTPixelFormat format, uint32_t w, uint32_t h, enum WMTTextureUsage usage) {
+          WMTTextureInfo info{};
+          info.pixel_format = format;
+          info.width = w, info.height = h, info.depth = 1, info.array_length = 1;
+          info.type = WMTTextureType2D;
+          info.mipmap_level_count = 1, info.sample_count = 1;
+          info.usage = usage;
+          info.options = WMTResourceStorageModePrivate;
+          return MTLDevice_newTexture(device.handle, &info);
+        };
+        const enum WMTTextureUsage read = WMTTextureUsageShaderRead;
+        obj_handle_t color = texture(WMTPixelFormatRGBA8Unorm, 64, 36, read);
+        obj_handle_t previous = texture(WMTPixelFormatRGBA8Unorm, 64, 36, read);
+        obj_handle_t depth = texture(WMTPixelFormatDepth32Float, 64, 36, read);
+        obj_handle_t motion = texture(WMTPixelFormatRG16Float, 64, 36, read);
+        obj_handle_t output = texture(WMTPixelFormatBGRA8Unorm, 128, 72, WMTTextureUsageShaderWrite);
+        obj_handle_t cmdbuf = MTLCommandQueue_commandBuffer(queue);
+        // the bridge hands back an autoreleased buffer, so holding it across calls needs a reference of its own;
+        // releasing it at the end without this is an over-release, which is what a first run of this check showed
+        if (cmdbuf)
+          NSObject_retain(cmdbuf);
+        if (expect(color && previous && depth && motion && output && cmdbuf, "no textures or buffer to interpolate with")) {
+          WMTFXFrameInterpolateArgs args{};
+          args.color = color, args.prev_color = previous, args.depth = depth, args.motion = motion;
+          args.output = output;
+          args.ui = 0, args.fence = 0;
+          args.motion_vector_scale_x = 1.f, args.motion_vector_scale_y = 1.f;
+          args.delta_time = 1.f / 60.f;
+          MTLCommandBuffer_encodeFrameInterpolation(cmdbuf, interpolator, &args);
+          MTLCommandBuffer_commit(cmdbuf);
+          MTLCommandBuffer_waitUntilCompleted(cmdbuf);
+          expect(MTLCommandBuffer_status(cmdbuf) == WMTCommandBufferStatusCompleted,
+                 "the interpolated frame did not complete (%llu)", (unsigned long long)MTLCommandBuffer_status(cmdbuf));
+          expect(MTLCommandBuffer_error(cmdbuf) == 0, "the GPU reported an error interpolating a frame");
+        }
+        for (obj_handle_t o : {cmdbuf, output, motion, depth, previous, color, queue})
+          if (o)
+            NSObject_release(o);
+      }
+      NSObject_release(interpolator);
+    }
+  }
   // Maximum total threadgroup memory allocation and Maximum threads per threadgroup
   expect(answer("maxThreadgroupMemoryLength") == 32 * 1024, "threadgroup memory is not 32 KB");
   expect(answer("maxThreadsPerThreadgroup") == 1024, "a threadgroup is not 1024 threads");

@@ -96,4 +96,69 @@ private:
   WMT::Reference<WMT::ComputePipelineState> pipelines_[2];
 };
 
+// a footprint's raw BC4/BC5 SNORM blocks decode into the float texels the decoded storage holds, the
+// same decode an initial-data upload runs on the CPU (mullion_resource_initializer.cpp)
+template <typename Context> class BCSnormDecode {
+public:
+  BCSnormDecode(Context &ctx) : ctx_(ctx) {}
+
+  void run(WMT::Buffer src, uint64_t src_offset, WMT::Buffer dst, uint64_t dst_offset, BCSnormDecodeLayout layout,
+           WMTSize size) {
+    auto &pso = pipelines_[layout.rg ? 1 : 0];
+    if (!pso) {
+      pso = ctx_.getComputePipeline("cs_decode_bc_snorm");
+      if (!pso) {
+        ERR("Failed to create the BC SNORM decode pipeline");
+        abort();
+      }
+    }
+    ctx_.endPass();
+    ctx_.startComputePass();
+    ctx_.setComputePSO(pso, {pso.threadExecutionWidth(), 1, 1});
+    ctx_.setComputeBuffer(0, src, src_offset);
+    ctx_.setComputeBuffer(1, dst, dst_offset);
+    memcpy(ctx_.setComputeBytes(2, sizeof(layout)), &layout, sizeof(layout));
+    ctx_.dispatch(size);
+    ctx_.endPass();
+    ctx_.startBlitPass();
+  }
+
+private:
+  SimpleCommandContext<Context> ctx_;
+  WMT::Reference<WMT::ComputePipelineState> pipelines_[2];
+};
+
+// the raw block-compressed storage decodes into the SNORM companion's float texels: the copy that wrote
+// the blocks records this right after itself, and the companion is then what the SNORM views read
+template <typename Context> class BCSnormCompanionDecode {
+public:
+  BCSnormCompanionDecode(Context &ctx) : ctx_(ctx) {}
+
+  void run(const Rc<Texture> &raw, uint64_t raw_view, const Rc<Texture> &companion, uint64_t companion_view,
+           uint32_t width, uint32_t height, bool rg) {
+    auto &pso = pipelines_[rg ? 1 : 0];
+    if (!pso) {
+      pso = ctx_.getComputePipeline("cs_decode_bc_snorm_texture");
+      if (!pso) {
+        ERR("Failed to create the BC SNORM companion decode pipeline");
+        abort();
+      }
+    }
+    ctx_.endPass();
+    ctx_.startComputePass();
+    ctx_.setComputePSO(pso, {pso.threadExecutionWidth(), 1, 1});
+    ctx_.setComputeTexture(0, raw, raw_view, 0);
+    ctx_.setComputeTexture(1, companion, companion_view, 0);
+    uint32_t params[4] = {width, height, rg ? 1u : 0u, 0u};
+    memcpy(ctx_.setComputeBytes(2, sizeof(params)), params, sizeof(params));
+    ctx_.dispatch({width, height, 1});
+    ctx_.endPass();
+    ctx_.startBlitPass();
+  }
+
+private:
+  SimpleCommandContext<Context> ctx_;
+  WMT::Reference<WMT::ComputePipelineState> pipelines_[2];
+};
+
 } // namespace mullion
